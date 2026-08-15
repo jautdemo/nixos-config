@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - healthcheck-cronjob.yaml
+  - namespace.yaml
+  - nfs-media.yaml
+  - pvc.yaml
+  - service.yaml

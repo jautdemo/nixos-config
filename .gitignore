@@ -1,0 +1,27 @@
+.DS_Store
+
+result
+result-*
+
+**/.terraform/
+**/terraform.tfstate
+**/terraform.tfstate.backup
+**/*.tfstate.*
+**/*.tfvars
+**/*.tfvars.json
+**/override.tf
+**/override.tf.json
+**/*_override.tf
+**/*_override.tf.json
+
+*.pem
+*.key
+# The step-ca root is the public trust anchor every client already needs.
+!k8s/certs/step-ca-root.pem
+!k8s/certs/k8s-service-account.pem
+
+
+*.agekey
+*age*.key
+sops-age*
+!secrets/sops-age.age

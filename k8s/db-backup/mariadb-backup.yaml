@@ -1,0 +1,108 @@
+# Logical mariadb dump -> NAS, age-encrypted. Longhorn snapshots of live
+# InnoDB are only crash-consistent; this one is application-consistent and
+# restorable anywhere. 08:20, picked up by the 09:00 offsite sync.
+#
+# Dedicated read-only 'backup'@'%' user; root connects locally with the
+# password (the image sets no unix_socket auth).
+# The mariadb deployment's postStart recreates the user from the SOPS
+# secret (k8s/mariadb/backup-credentials-secret.yaml) on every pod start;
+# rotate = edit the secret, then delete the mariadb pod.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: db-backup-mariadb-nfs
+spec:
+  capacity: { storage: 5Gi }
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  mountOptions: [nfsvers=4.1, sec=sys, hard, noatime]
+  nfs:
+    server: nas.infra.homelab.invalid
+    path: /volume1/longhorn-backups/db-backup
+  storageClassName: ""
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: db-backup-nfs
+  namespace: mariadb
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  volumeName: db-backup-mariadb-nfs
+  resources: { requests: { storage: 5Gi } }
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: mariadb-backup
+  namespace: mariadb
+spec:
+  # NAS outage 2026-08-13: every run breaks on the dead NFS mount.
+  # Unsuspend when the NAS is back.
+  suspend: true
+  # Staggered: no two backup jobs share a minute - clustered backup
+  # I/O spikes etcd WAL fsync latency.
+  schedule: "20 8 * * *"
+  timeZone: "UTC"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Failures included: only new failures rotate the history out, so one
+      # transient failure would keep KubeJobFailed firing forever.
+      ttlSecondsAfterFinished: 86400
+      backoffLimit: 2
+      template:
+        metadata:
+          # Stable label so the mariadb NetworkPolicy can allow this job in
+          # specifically.
+          # default-deny-ingress does not exempt this job just for sharing the
+          # namespace: NetworkPolicy has no implicit same-namespace allow, so
+          # the policy needs this label.
+          labels:
+            app: mariadb-backup
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: alpine:3.24
+              env:
+                - name: MARIADB_PASSWORD
+                  valueFrom:
+                    secretKeyRef: { name: mariadb-backup-credentials, key: password }
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  set -o pipefail   # else a mariadb-dump failure is masked by gzip|age
+                  DATE=$(date +%Y-%m-%d_%H%M%S)
+                  OUT="/backup/mariadb-${DATE}.sql.gz.age"
+                  apk add --no-cache mariadb-client age gzip curl >/dev/null
+
+                  # Application-consistent dump of all databases (InnoDB single
+                  # transaction; --master-data off since we're not replicating).
+                  mariadb-dump \
+                    --host=mariadb.mariadb.svc --user=backup \
+                    --password="${MARIADB_PASSWORD}" \
+                    --all-databases --single-transaction --quick \
+                    --routines --triggers --events \
+                  | gzip | age -R /age/recipients -o "${OUT}"
+
+                  # sanity: the dump must be non-trivial (catches a silent empty dump)
+                  SZ=$(stat -c%s "${OUT}")
+                  echo "wrote ${OUT} (${SZ} bytes)"
+                  [ "${SZ}" -gt 1024 ] || { echo "ERROR: dump suspiciously small"; exit 1; }
+
+                  find /backup -name "mariadb-*.sql.gz.age" -mtime +14 -delete
+
+                  # backup-audit verifies this artifact; no ping needed here.
+              volumeMounts:
+                - { name: backup, mountPath: /backup }
+                - { name: age, mountPath: /age, readOnly: true }
+          volumes:
+            - name: age
+              configMap: { name: age-recipients }
+            - name: backup
+              persistentVolumeClaim: { claimName: db-backup-nfs }

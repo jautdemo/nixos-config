@@ -1,0 +1,31 @@
+# kured serialises reboots: cluster-wide lock, cordon, drain, reboot,
+# uncordon. NixOS autoUpgrade with allowReboot just calls systemctl reboot.
+configuration:
+  # The lock is the point: only one node may hold it, so two can never be down
+  # at once. A per-node weekday stagger cannot stop a manual reboot coinciding
+  # with a scheduled one, and never checks the previous node came back.
+  lockTtl: 30m
+  # Only reboot inside the same window the upgrades used, in local time.
+  startTime: "03:00"
+  endTime: "05:00"
+  timeZone: "UTC"
+  # 5m, not 1h: kured only stat()s a file, so polling is nearly free, and an
+  # hourly cadence dominates the lag between staging a kernel and rebooting.
+  # At 2 checks a night, an upgrade finishing after the last one defers the
+  # reboot a full day, leaving new userspace on the old kernel.
+  period: 5m
+  # Drain settings. --ignore-daemonsets is required (DaemonSets are meant to
+  # stay), --delete-emptydir-data because several pods here use emptyDir and
+  # drain refuses otherwise.
+  drainTimeout: 5m
+  drainGracePeriod: 60
+  # /var/run/reboot-required does not exist on NixOS. A service creates it by
+  # comparing /run/booted-system with /run/current-system.
+  rebootSentinel: /var/run/reboot-required
+  # kured nsenters into the host namespaces, and NixOS keeps /bin almost
+  # empty, so /bin/systemctl does not exist. A wrong path here fails silently
+  # every night: lock, cordon, drain, run nothing, uncordon.
+  # Use the stable /run/current-system symlink, never a /nix/store path.
+  rebootCommand: /run/current-system/sw/bin/systemctl reboot
+metrics:
+  create: true

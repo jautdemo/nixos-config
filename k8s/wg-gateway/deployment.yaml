@@ -1,0 +1,133 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wg-gateway
+  namespace: wg-gateway
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: wg-gateway
+  template:
+    metadata:
+      labels:
+        app: wg-gateway
+    spec:
+      # Dial-out gateway: the pod initiates the tunnel to brainerd and keeps
+      # the NAT mapping alive with PersistentKeepalive. Nothing needs to reach
+      # this pod from outside, so it runs on the ordinary pod network and can
+      # be rescheduled to any node. No hostNetwork, no VIP, no port-forward.
+      # NOTE: this stays a single-replica Deployment on purpose, it must never
+      # become a DaemonSet. brainerd has exactly one WireGuard peer registered,
+      # so three pods would all present the same key and fight over the tunnel.
+      terminationGracePeriodSeconds: 10
+      # Public resolvers, no cluster DNS: the pod resolves exactly one public
+      # name (brainerd's endpoint) and must be able to do so even when
+      # CoreDNS/AdGuard are down, the tunnel is infrastructure beneath them.
+      dnsPolicy: None
+      dnsConfig:
+        nameservers:
+          - 1.1.1.1
+          - 9.9.9.9
+      # Fail over quickly if the node dies (default is 5 minutes).
+      tolerations:
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 10
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 10
+      initContainers:
+        # Forwarding between wg0 and eth0 requires ip_forward inside the pod
+        # netns; /proc/sys is read-only for non-privileged containers, so a
+        # privileged init sets it (namespaced sysctl, does not touch the host).
+        - name: sysctl
+          image: ghcr.io/linuxserver/wireguard:1.0.20260223-r0-ls117
+          command: ["sysctl", "-w", "net.ipv4.ip_forward=1"]
+          securityContext:
+            privileged: true
+      containers:
+        # socat TERMINATES each connection and dials the VIP itself, making the
+        # traffic pod-ORIGINATED and therefore handled by socket-LB. Merely
+        # FORWARDING raw packets at a VIP does not work reliably: Cilium's eBPF
+        # service translation for routed-through traffic breaks on Service
+        # recreation and on backend pod failover, silently.
+        # brainerd addresses these ports straight at this pod's tunnel IP, so
+        # plain listeners suffice, no iptables. loki (3100) still uses raw
+        # forwarding; move it here if it ever breaks the same way.
+        - name: vip-relay
+          image: alpine/socat:1.8.1.3
+          command:
+            - sh
+            - -c
+            - |
+              # 443 goes straight to AdGuard (.221), not Traefik (.220): the
+              # only thing on public 443 is DoH and AdGuard terminates its
+              # TLS itself, so brainerd's 443 has no path to Traefik at all -
+              # origin bypass is structurally impossible rather than merely
+              # refused.
+              # BEGIN socat: nix run .#regenerate-manifests overwrites this block from cluster.json
+              socat TCP-LISTEN:443,fork,reuseaddr TCP:192.168.1.221:443 &
+              socat TCP-LISTEN:853,fork,reuseaddr TCP:192.168.1.221:853 &
+              socat UDP-LISTEN:853,fork,reuseaddr UDP:192.168.1.221:853 &
+              socat TCP-LISTEN:64738,fork,reuseaddr TCP:192.168.1.223:64738 &
+              socat UDP-LISTEN:64738,fork,reuseaddr UDP:192.168.1.223:64738 &
+              # END socat
+              # if any relay dies, exit so the container restarts them all
+              wait -n
+              exit 1
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+        - name: wireguard
+          image: ghcr.io/linuxserver/wireguard:1.0.20260223-r0-ls117
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities:
+              add: [NET_ADMIN]
+          # The wireguard kernel module is loaded on every node via NixOS
+          # boot.kernelModules, the container never needs modprobe.
+          livenessProbe:
+            exec:
+              command: ["ping", "-c", "1", "-W", "2", "10.8.0.1"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["wg-quick", "down", "wg0"]
+          volumeMounts:
+            - name: wg-config
+              mountPath: /config/wg_confs/wg0.conf
+              subPath: wg0.conf
+              readOnly: true
+            - name: wg-key
+              mountPath: /etc/wireguard/private.key
+              subPath: private.key
+              readOnly: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+      volumes:
+        # The conf is plaintext and reviewable; only the key is a Secret, set
+        # onto the interface by the first PostUp in wg0.conf.
+        - name: wg-config
+          configMap:
+            name: wg-gateway-conf
+            defaultMode: 0400
+        - name: wg-key
+          secret:
+            secretName: wg-gateway-key
+            defaultMode: 0400

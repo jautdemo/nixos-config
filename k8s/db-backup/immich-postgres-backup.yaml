@@ -1,0 +1,101 @@
+# Application-consistent Immich Postgres dump to the NAS, age-encrypted.
+# Longhorn's snapshot is only crash-consistent, which is a weaker guarantee.
+# Reuses the immich-postgres Secret's password: single-app DB, so no separate
+# backup user is needed the way mariadb's multi-database instance has one.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: db-backup-immich-postgres-nfs
+spec:
+  capacity: { storage: 5Gi }
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  mountOptions: [nfsvers=4.1, sec=sys, hard, noatime]
+  nfs:
+    server: nas.infra.homelab.invalid
+    path: /volume1/longhorn-backups/db-backup
+  storageClassName: ""
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: db-backup-immich-postgres-nfs
+  namespace: immich
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  volumeName: db-backup-immich-postgres-nfs
+  resources: { requests: { storage: 5Gi } }
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: immich-postgres-backup
+  namespace: immich
+spec:
+  # NAS outage 2026-08-13: every run breaks on the dead NFS mount.
+  # Unsuspend when the NAS is back.
+  suspend: true
+  schedule: "30 8 * * *"
+  timeZone: "UTC"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Failures included: only new failures rotate the history out, so one
+      # transient failure would keep KubeJobFailed firing forever.
+      ttlSecondsAfterFinished: 86400
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              # Match the server's major (16) so pg_dump's catalog assumptions
+              # line up; keep in lockstep with the server image.
+              image: ghcr.io/immich-app/postgres:16-vectorchord0.4.3-pgvectors0.2.0
+              env:
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef: { name: immich-postgres, key: password }
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  # NOTE: this image is Debian bookworm (apt-get, not apk,
+                  # unlike the alpine-based mariadb/redis backup jobs), and
+                  # its /bin/sh is dash, which has no `set -o pipefail` either,
+                  # dump to a plain file first and check pg_dump's own exit
+                  # code explicitly instead of relying on a pipeline.
+                  apt-get update -qq && apt-get install -y -qq age curl >/dev/null
+                  DATE=$(date +%Y-%m-%d_%H%M%S)
+                  RAW="/tmp/immich-postgres-${DATE}.sql"
+                  OUT="/backup/immich-postgres-${DATE}.sql.gz.age"
+
+                  # Application-consistent dump (pg_dump's own MVCC snapshot,
+                  # no need for --single-transaction juggling like mysqldump).
+                  pg_dump \
+                    --host=immich-postgres.immich.svc --username=immich \
+                    --dbname=immich --no-owner \
+                    -f "${RAW}"
+
+                  gzip -c "${RAW}" | age -R /age/recipients -o "${OUT}"
+                  rm -f "${RAW}"
+
+                  # sanity: the dump must be non-trivial (catches a silent empty dump)
+                  SZ=$(stat -c%s "${OUT}")
+                  echo "wrote ${OUT} (${SZ} bytes)"
+                  [ "${SZ}" -gt 1024 ] || { echo "ERROR: dump suspiciously small"; exit 1; }
+
+                  find /backup -name "immich-postgres-*.sql.gz.age" -mtime +14 -delete
+
+                  # backup-audit verifies this artifact; no ping needed here.
+              volumeMounts:
+                - { name: backup, mountPath: /backup }
+                - { name: age, mountPath: /age, readOnly: true }
+          volumes:
+            - name: age
+              configMap: { name: age-recipients }
+            - name: backup
+              persistentVolumeClaim: { claimName: db-backup-immich-postgres-nfs }

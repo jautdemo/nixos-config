@@ -1,0 +1,552 @@
+# Default deny-all ingress for all app namespaces.
+# Each namespace gets: deny-all + allow-from-traefik (if ingressed).
+# Cross-namespace allows are added where needed. Ingress-only: egress policy
+# is a separate, unwritten work item - nothing here constrains
+# outbound traffic.
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: adguard
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-traefik
+  namespace: adguard
+spec:
+  podSelector:
+    matchLabels:
+      app: adguard
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik
+  policyTypes: [Ingress]
+---
+# DNS: adguard needs to accept DNS from the entire cluster (LB VIP .221)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-ingress
+  namespace: adguard
+spec:
+  podSelector:
+    matchLabels:
+      app: adguard
+  ingress:
+    - ports:
+        - port: 53
+          protocol: TCP
+        - port: 53
+          protocol: UDP
+        - port: 853
+          protocol: TCP
+        - port: 853
+          protocol: UDP
+        - port: 443
+          protocol: TCP
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: authelia
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-traefik
+  namespace: authelia
+spec:
+  podSelector:
+    matchLabels:
+      app: authelia
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik
+  policyTypes: [Ingress]
+---
+# Traefik also calls authelia for forward-auth on every request
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-traefik-forwardauth
+  namespace: authelia
+spec:
+  podSelector:
+    matchLabels:
+      app: authelia
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik
+      ports:
+        - port: 9091
+          protocol: TCP
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: redis
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-authelia
+  namespace: redis
+spec:
+  podSelector:
+    matchLabels:
+      app: redis
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: authelia
+        # redis-backup: same namespace as redis, but NetworkPolicy does not
+        # implicitly allow same-namespace traffic.
+        - podSelector:
+            matchLabels:
+              app: redis-backup
+      ports:
+        - port: 6379
+          protocol: TCP
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: mariadb
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-authelia-and-phpmyadmin
+  namespace: mariadb
+spec:
+  podSelector:
+    matchLabels:
+      app: mariadb
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: authelia
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: phpmyadmin
+        # mariadb-backup: same namespace as mariadb, but NetworkPolicy does not
+        # implicitly allow same-namespace traffic.
+        - podSelector:
+            matchLabels:
+              app: mariadb-backup
+      ports:
+        - port: 3306
+          protocol: TCP
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: phpmyadmin
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-traefik
+  namespace: phpmyadmin
+spec:
+  podSelector:
+    matchLabels:
+      app: phpmyadmin
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: whoami
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-traefik
+  namespace: whoami
+spec:
+  podSelector:
+    matchLabels:
+      app: whoami
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: mumble
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-mumble-traffic
+  namespace: mumble
+spec:
+  podSelector:
+    matchLabels:
+      app: mumble
+  ingress:
+    - ports:
+        - port: 64738
+          protocol: TCP
+        - port: 64738
+          protocol: UDP
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: plex
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-plex-traffic
+  namespace: plex
+spec:
+  podSelector:
+    matchLabels:
+      app: plex
+  ingress:
+    - ports:
+        - port: 32400
+          protocol: TCP
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: external-dns
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: external
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: diun
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: secrets-backup
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+# Still in audit mode (policyAuditMode: true): nothing is dropped, only
+# logged via Hubble.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: longhorn-system
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+# UI is ingressed via Traefik (longhorn.homelab.invalid -> longhorn-frontend)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-traefik
+  namespace: longhorn-system
+spec:
+  podSelector:
+    matchLabels:
+      app: longhorn-ui
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik
+  policyTypes: [Ingress]
+---
+# kube-apiserver calls the Longhorn admission webhook for every CRD write.
+# apiserver runs on the host network, so the source is a node IP rather than
+# a pod selector, hence the LAN ipBlock.
+#
+# This rule alone does not work under Cilium - the CiliumNetworkPolicy below
+# is what lets the apiserver through. Kept as the portable intent.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-apiserver-webhook
+  namespace: longhorn-system
+spec:
+  podSelector:
+    matchLabels:
+      longhorn.io/admission-webhook: longhorn-admission-webhook
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: 192.168.1.0/24
+      ports:
+        - port: 9502
+          protocol: TCP
+  policyTypes: [Ingress]
+---
+# Cilium does not match node-originated traffic against `ipBlock`: the host
+# gets the reserved `host` identity and other nodes `remote-node`, neither
+# IP-based. An ipBlock-only rule still admits same-node calls (host -> pod is
+# allowed by default), so it fails only for remote-node apiservers - partially
+# and hard to see.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-apiserver-webhook-nodes
+  namespace: longhorn-system
+spec:
+  endpointSelector:
+    matchLabels:
+      longhorn.io/admission-webhook: longhorn-admission-webhook
+  ingress:
+    - fromEntities:
+        - host        # apiserver on the same node as the webhook pod
+        - remote-node # apiserver on any OTHER node
+      toPorts:
+        - ports:
+            - port: "9502"
+              protocol: TCP
+---
+# Intra-namespace: longhorn-manager/engine/instance-manager/csi-plugin talk to
+# each other constantly (replica sync, iSCSI, recovery-backend, backend API).
+# Prometheus (monitoring ns) also scrapes longhorn-manager's metrics port here.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace-and-monitoring
+  namespace: longhorn-system
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: longhorn-system
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+  policyTypes: [Ingress]
+---
+# Prometheus does not scrape into any other app namespace, so this
+# namespace's own ingress is what needs covering, not egress from it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: monitoring
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+# Grafana is ingressed via Traefik (grafana.homelab.invalid)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-traefik
+  namespace: monitoring
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: grafana
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik
+  policyTypes: [Ingress]
+---
+# Intra-namespace: Prometheus scrapes alertmanager/kube-state-metrics/
+# node-exporter/grafana/operator, all within this namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace
+  namespace: monitoring
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+  policyTypes: [Ingress]
+---
+# loki and alloy-syslog are exposed on LoadBalancer VIPs for cluster-wide and
+# brainerd log push, same "open on this port, any source" pattern as adguard's
+# allow-dns-ingress, with no `from:` restriction.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-loki-push
+  namespace: monitoring
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: loki
+  ingress:
+    - ports:
+        - port: 3100
+          protocol: TCP
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-syslog-push
+  namespace: monitoring
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: alloy
+  ingress:
+    - ports:
+        - port: 1514
+          protocol: TCP
+  policyTypes: [Ingress]
+---
+# This policy is what makes forwardedHeaders.trustedIPs safe: traefik trusts
+# X-Forwarded-For from the whole pod CIDR, so without it any pod could spoof
+# a header. Ports are the CONTAINER ports (8000/8443), not the Service's.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: traefik
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-cloudflare-relay-and-lan
+  namespace: traefik
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: traefik
+  ingress:
+    # The Cloudflare Tunnel path: cloudflared runs in-cluster and dials
+    # Traefik directly, 8443 only, since the tunnel only ever proxies HTTPS.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: cloudflared-web
+          podSelector:
+            matchLabels:
+              app: cloudflared-web
+      ports:
+        - port: 8443
+          protocol: TCP
+    # Direct LAN clients hitting the .220 VIP for internal-only hostnames
+    # (nas, longhorn, mediadb, printer, switches, the AdGuard
+    # rewrites). Real source IP here, unlike the relay path above.
+    # NOTE this covers real LAN devices but not the k8s nodes themselves,
+    # even though their IPs are inside this /24, see the CiliumNetworkPolicy
+    # below.
+    - from:
+        - ipBlock:
+            cidr: 192.168.1.0/24
+      ports:
+        - port: 8000
+          protocol: TCP
+        - port: 8443
+          protocol: TCP
+  policyTypes: [Ingress]
+---
+# Same Cilium ipBlock blind spot as the longhorn-system webhook policy above:
+# node-originated traffic carries the `host` / `remote-node` identity, so the
+# LAN CIDR never matches it even though the nodes sit inside that /24.
+# Harmless for LAN clients, which reach the .220 VIP under
+# externalTrafficPolicy: Local and always land on the local traefik pod. It
+# bites anything originating ON a node resolving an internal hostname.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-nodes-to-traefik
+  namespace: traefik
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: traefik
+  ingress:
+    - fromEntities:
+        - host
+        - remote-node
+      toPorts:
+        - ports:
+            - port: "8000"
+              protocol: TCP
+            - port: "8443"
+              protocol: TCP

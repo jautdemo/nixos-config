@@ -1,0 +1,6 @@
+# sops rules for k8s/ secrets: encrypt values only, keys stay diffable;
+# kustomize-controller decrypts at apply time
+creation_rules:
+  - path_regex: k8s/.*\.yaml$
+    encrypted_regex: ^(data|stringData)$
+    age: age1deadbeef03deadbeef03deadbeef03deadbeef03deadbeef03dead

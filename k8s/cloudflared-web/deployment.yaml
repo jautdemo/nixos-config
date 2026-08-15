@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared-web
+  namespace: cloudflared-web
+spec:
+  # 2 replicas: Cloudflare's edge load-balances across concurrent connectors
+  # on the same tunnel, so this is ordinary HA - no single-peer constraint
+  # like wg-gateway's.
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cloudflared-web
+  template:
+    metadata:
+      labels:
+        app: cloudflared-web
+    spec:
+      # Both connectors on one node means a single node reboot drops the
+      # tunnel entirely, which is the public entry point. Soft constraint
+      # (ScheduleAnyway) for the same reason coredns does:
+      # a hard rule could leave a replica Pending during a kured drain.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: cloudflared-web
+      containers:
+        - name: cloudflared
+          image: cloudflare/cloudflared:2026.7.3
+          args:
+            - tunnel
+            - --no-autoupdate
+            - --metrics
+            - 0.0.0.0:2000
+            - run
+          # Ingress rules live in Cloudflare, pushed by terraform
+          # (config_src = "cloudflare"); this pod only authenticates as a
+          # connector. Adding a hostname is a terraform change, not a redeploy.
+          env:
+            - name: TUNNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  # SOPS-encrypted in token-secret.yaml; refresh it from
+                  # `terraform output -raw cloudflared_web_tunnel_token` if
+                  # the tunnel is ever recreated.
+                  name: cloudflared-web-token
+                  key: token
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 2000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi

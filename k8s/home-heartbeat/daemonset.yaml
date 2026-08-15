@@ -1,0 +1,65 @@
+# Dead-man's-switch: internal alerting goes silent when the link or cluster
+# dies, so these pings stop instead and healthchecks.io alerts from outside.
+# brainerd covers the edge-down case.
+#
+# DaemonSet so one dead node doesn't lapse every check at once; duplicate
+# pings are harmless. Probes /metrics, not a bare TCP port, so "serving" is
+# what's tested. Checks: period 1m, grace ~10m.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: home-heartbeat
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels: { app: home-heartbeat }
+  template:
+    metadata:
+      labels: { app: home-heartbeat }
+    spec:
+      containers:
+        - name: heartbeat
+          image: curlimages/curl:8.21.0
+          env:
+            - name: PING_KEY
+              valueFrom:
+                secretKeyRef: { name: healthchecks-ping, key: ping-key }
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+
+              # slug=ip, every home component runs node-exporter on :9100.
+              # BEGIN targets: nix run .#regenerate-manifests overwrites this block from cluster.json
+              TARGETS="
+              duluth=192.168.1.195
+              bemidji=192.168.1.196
+              fargo=192.168.1.197
+              edenprairie=192.168.1.193
+              nas=192.168.1.194
+              "
+              # END targets
+
+              if [ -z "${PING_KEY}" ]; then
+                echo "FATAL: PING_KEY empty - set the healthchecks-ping secret"; exit 1
+              fi
+
+              while true; do
+                for t in $TARGETS; do
+                  slug=${t%%=*}; ip=${t#*=}
+                  if curl -sf -m4 -o /dev/null "http://${ip}:9100/metrics"; then
+                    curl -fsS -m10 -o /dev/null "https://hc-ping.com/${PING_KEY}/${slug}?create=1" \
+                      && echo "$(date -u +%FT%TZ) $slug up" \
+                      || echo "$(date -u +%FT%TZ) $slug up (ping failed to reach hc.io)"
+                  else
+                    # skip the ping: grace absorbs blips; a real outage lapses
+                    # the timer on ALL probers and healthchecks.io alerts.
+                    echo "$(date -u +%FT%TZ) $slug DOWN (probe failed, not pinging)"
+                  fi
+                done
+                sleep 60
+              done
+          resources:
+            requests: { cpu: 5m, memory: 16Mi }
+            limits: { memory: 32Mi }

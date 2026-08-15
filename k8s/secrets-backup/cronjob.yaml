@@ -1,0 +1,66 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: secrets-backup
+  namespace: secrets-backup
+spec:
+  # NAS outage 2026-08-13: every run breaks on the dead NFS mount.
+  # Unsuspend when the NAS is back.
+  suspend: true
+  # Staggered across the window on purpose: clustering the four backup jobs
+  # correlates with etcd WAL fsync latency spikes on duluth.
+  schedule: "50 8 * * *"
+  timeZone: "UTC"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Failures included: only new failures rotate the history out, so one
+      # transient failure would keep KubeJobFailed firing forever. Safe because
+      # backup success is judged from the artifacts on NFS, not from Jobs.
+      ttlSecondsAfterFinished: 86400
+      backoffLimit: 2
+      template:
+        spec:
+          serviceAccountName: secrets-backup
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              # alpine/k8s: kubectl ships in the image instead of being
+              # curled unpinned from dl.k8s.io on every run.
+              image: alpine/k8s:1.36.2
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+
+                  BACKUP_DIR="/backup"
+                  DATE=$(date +%Y-%m-%d_%H%M%S)
+                  OUTFILE="${BACKUP_DIR}/secrets-${DATE}.json.age"
+
+                  apk add --no-cache age >/dev/null
+
+                  echo "Exporting secrets..."
+                  kubectl get secrets --all-namespaces -o json | \
+                    age -R /age/recipients -o "${OUTFILE}"
+
+                  find "${BACKUP_DIR}" -name "secrets-*.json.age" -mtime +30 -delete
+
+                  echo "Backup complete: ${OUTFILE}"
+                  ls -lh "${OUTFILE}"
+
+                  # backup-audit verifies this artifact; no ping needed here.
+              volumeMounts:
+                - name: backup-volume
+                  mountPath: /backup
+                - name: age
+                  mountPath: /age
+                  readOnly: true
+          volumes:
+            - name: backup-volume
+              persistentVolumeClaim:
+                claimName: secrets-backup-nfs
+            - name: age
+              configMap:
+                name: age-recipients

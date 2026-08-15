@@ -1,0 +1,12 @@
+# The LoadBalancer IP range. A Service claims from it with the
+# lbipam.cilium.io/ips annotation.
+apiVersion: cilium.io/v2
+kind: CiliumLoadBalancerIPPool
+metadata:
+  name: default-pool
+spec:
+  blocks:
+    # BEGIN pool: nix run .#regenerate-manifests overwrites this block from cluster.json
+    - start: 192.168.1.220
+      stop: 192.168.1.229
+    # END pool

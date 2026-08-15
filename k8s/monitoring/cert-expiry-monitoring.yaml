@@ -1,0 +1,88 @@
+# Expiry alerting for every certificate either metric source can see:
+# cert_not_after_timestamp_seconds comes from the hosts' cert-metrics timer
+# (step-ca chain, lldap, protonmail-bridge, k8s PKI), and cert-manager reports
+# its own certificates once its ServiceMonitor is scraped.
+#
+# Both renewal mechanisms renew inside 30 days of expiry, so under 14 days
+# means renewal has been failing for over two weeks - never a normal state.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cert-expiry
+  namespace: monitoring
+  labels:
+    app: kube-prometheus-stack
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: cert-expiry
+      rules:
+        - alert: CertificateRenewalOverdue
+          expr: cert_not_after_timestamp_seconds - time() < 14 * 86400
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.cert }} on {{ $labels.instance }} expires in under 14 days"
+            description: "Renewal runs at 30 days out, so it has been failing for two weeks. Check k8s-pki-renewal or the step-cert timer on the host."
+
+        # From the ca-root-check timer on edenprairie. Zero means the live
+        # step-ca root is missing from the committed trust file, so the next
+        # deploy would distrust the CA fleet-wide.
+        - alert: CARootDivergedFromRepo
+          expr: stepca_root_in_repo == 0
+          for: 1h
+          labels:
+            severity: critical
+          annotations:
+            summary: "Committed CA root no longer contains the live step-ca root"
+            description: "k8s/certs/step-ca-root.pem and /etc/step-ca/certs/root_ca.crt on edenprairie disagree. Either finish the rotation (nix run .#rotate-ca -- status) or restore whichever side changed unexpectedly."
+
+        - alert: CertificateExpiryImminent
+          expr: cert_not_after_timestamp_seconds - time() < 7 * 86400
+          for: 1h
+          labels:
+            severity: critical
+          annotations:
+            summary: "{{ $labels.cert }} on {{ $labels.instance }} expires in under 7 days"
+            description: "Renew by hand now; whatever serves this cert goes down when it lapses."
+
+        - alert: CertManagerCertRenewalOverdue
+          expr: certmanager_certificate_expiration_timestamp_seconds - time() < 14 * 86400
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "cert-manager cert {{ $labels.namespace }}/{{ $labels.name }} expires in under 14 days"
+            description: "kubectl -n {{ $labels.namespace }} describe certificate {{ $labels.name }}"
+
+        - alert: CertManagerCertExpiryImminent
+          expr: certmanager_certificate_expiration_timestamp_seconds - time() < 7 * 86400
+          for: 1h
+          labels:
+            severity: critical
+          annotations:
+            summary: "cert-manager cert {{ $labels.namespace }}/{{ $labels.name }} expires in under 7 days"
+            description: "kubectl -n {{ $labels.namespace }} describe certificate {{ $labels.name }}"
+
+        - alert: CertFileUnreadable
+          expr: cert_file_readable == 0
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.cert }} on {{ $labels.instance }} is missing or not parseable"
+            description: "The file is gone or corrupt, and its expiry alert is blind while this fires."
+
+        # The .prom file persists on disk, so a dead cert-metrics timer leaves
+        # the rules above evaluating frozen values.
+        - alert: CertMetricsStale
+          expr: >-
+            absent(cert_metrics_last_run_timestamp_seconds)
+            or time() - cert_metrics_last_run_timestamp_seconds > 172800
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "cert-metrics has stopped updating"
+            description: "No cert-metrics run in 48h on {{ $labels.instance }}; the cert expiry alerts are reading stale values."

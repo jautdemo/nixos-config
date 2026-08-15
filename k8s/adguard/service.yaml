@@ -1,0 +1,94 @@
+# Dedicated VIP for plain DNS + DoT + DoH + DoQ, via Cilium LB-IPAM and L2
+# announcements.
+#
+# DoQ (UDP 853) is a port on this Service, not a separate one. Applied
+# SERVER-SIDE: strategic merge keys ports by `port` alone, so 853/TCP and
+# 853/UDP collide and one is silently dropped. Flux always applies server-side;
+# a hand-run `kubectl apply` needs --server-side.
+apiVersion: v1
+kind: Service
+metadata:
+  name: adguard-dns
+  namespace: adguard
+  annotations:
+    # BEGIN vip: nix run .#regenerate-manifests overwrites this block from cluster.json
+    lbipam.cilium.io/ips: "192.168.1.221"
+    # END vip
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app: adguard
+  ports:
+    - name: dns-udp
+      port: 53
+      targetPort: 53
+      protocol: UDP
+    - name: dns-tcp
+      port: 53
+      targetPort: 53
+      protocol: TCP
+    - name: dot
+      port: 853
+      targetPort: 853
+      protocol: TCP
+    # DoQ (DNS-over-QUIC). AdGuard advertises doq:853 via DDR, so
+    # QUIC-capable clients (Android "Automatic"/DDR-upgraded) try UDP 853
+    # first; without a listener they blackhole and stall ~30s before
+    # falling back to DoT, the intermittent "loads after 30s" symptom.
+    - name: doq
+      port: 853
+      targetPort: 853
+      protocol: UDP
+    - name: doh
+      port: 443
+      targetPort: 443
+      protocol: TCP
+---
+# Web UI.
+# sessionAffinity: adguard is a DaemonSet, so there
+# are 3 pods each with their own statistics and query log. Without
+# stickiness, consecutive UI requests round-robin between them and the
+# dashboard flickers between three different views. This pins a browser
+# session to one pod; note it may still not be the lease-holding pod that
+# actually serves DNS traffic.
+apiVersion: v1
+kind: Service
+metadata:
+  name: adguard-web
+  namespace: adguard
+spec:
+  type: ClusterIP
+  sessionAffinity: ClientIP
+  selector:
+    app: adguard
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: adguard-web
+  namespace: adguard
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    traefik.ingress.kubernetes.io/router.middlewares: external-authelia@kubernetescrd
+spec:
+  tls:
+    - hosts:
+        - dns.homelab.invalid
+      secretName: adguard-web-tls
+  rules:
+    - host: dns.homelab.invalid
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: adguard-web
+                port:
+                  number: 80

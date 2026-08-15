@@ -1,0 +1,432 @@
+# kube-prometheus-stack values.
+
+# The stock KubePersistentVolumeFillingUp is purely relative (<15% free), which
+# on the ~10Ti NFS shares means alerting with 1.4Ti left. Both legs are needed:
+# without the relative one an empty 1Gi PVC reads critical forever; without the
+# absolute one the big shares cry wolf.
+defaultRules:
+  disabled:
+    KubePersistentVolumeFillingUp: true
+
+additionalPrometheusRulesMap:
+  pvc-filling-up-absolute:
+    groups:
+      - name: pvc-filling-up-absolute
+        rules:
+          - alert: KubePersistentVolumeFillingUp
+            expr: |-
+              (
+                kubelet_volume_stats_available_bytes{job="kubelet", namespace=~".*", metrics_path="/metrics"}
+                  /
+                kubelet_volume_stats_capacity_bytes{job="kubelet", namespace=~".*", metrics_path="/metrics"}
+              ) < 0.03
+              and
+              # 500GB, decimal (500 * 1000^3 = 500000000000 bytes)
+              kubelet_volume_stats_available_bytes{job="kubelet", namespace=~".*", metrics_path="/metrics"} < 500000000000
+              and
+              kubelet_volume_stats_used_bytes{job="kubelet", namespace=~".*", metrics_path="/metrics"} > 0
+              unless on (cluster, namespace, persistentvolumeclaim)
+              kube_persistentvolumeclaim_access_mode{ access_mode="ReadOnlyMany"} == 1
+              unless on (cluster, namespace, persistentvolumeclaim)
+              kube_persistentvolumeclaim_labels{label_excluded_from_alerts="true"} == 1
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: PersistentVolume is filling up.
+              description: >-
+                {{ $labels.persistentvolumeclaim }} in {{ $labels.namespace }}:
+                {{ $value | humanizePercentage }} free and under 500GB absolute.
+              runbook_url: https://runbooks.prometheus-operator.dev/runbooks/kubernetes/kubepersistentvolumefillingup
+          - alert: KubePersistentVolumeFillingUp
+            expr: |-
+              (
+                kubelet_volume_stats_available_bytes{job="kubelet", namespace=~".*", metrics_path="/metrics"}
+                  /
+                kubelet_volume_stats_capacity_bytes{job="kubelet", namespace=~".*", metrics_path="/metrics"}
+              ) < 0.15
+              and
+              # 1TB, decimal (1 * 1000^4 = 1000000000000 bytes)
+              kubelet_volume_stats_available_bytes{job="kubelet", namespace=~".*", metrics_path="/metrics"} < 1000000000000
+              and
+              kubelet_volume_stats_used_bytes{job="kubelet", namespace=~".*", metrics_path="/metrics"} > 0
+              and
+              predict_linear(kubelet_volume_stats_available_bytes{job="kubelet", namespace=~".*", metrics_path="/metrics"}[6h], 4 * 24 * 3600) < 0
+              unless on (cluster, namespace, persistentvolumeclaim)
+              kube_persistentvolumeclaim_access_mode{ access_mode="ReadOnlyMany"} == 1
+              unless on (cluster, namespace, persistentvolumeclaim)
+              kube_persistentvolumeclaim_labels{label_excluded_from_alerts="true"} == 1
+            for: 1h
+            labels:
+              severity: warning
+            annotations:
+              summary: PersistentVolume is filling up.
+              description: >-
+                {{ $labels.persistentvolumeclaim }} in {{ $labels.namespace }}:
+                fills within 4 days and already under 1TB free.
+              runbook_url: https://runbooks.prometheus-operator.dev/runbooks/kubernetes/kubepersistentvolumefillingup
+
+prometheus:
+  prometheusSpec:
+    retention: 7d
+    retentionSize: 8GB
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+      limits:
+        memory: 2Gi
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: longhorn
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 50Gi
+    # Scrape all ServiceMonitors regardless of labels
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+
+    # Scrape infra nodes outside the k8s cluster
+    additionalScrapeConfigs:
+      - job_name: 'infra-node-exporter'
+        static_configs:
+          - targets: ['edenprairie.infra.homelab.invalid:9100']
+            labels:
+              instance: 'edenprairie'
+          - targets: ['nas.infra.homelab.invalid:9100']
+            labels:
+              instance: 'nas'
+
+      # k8s control-plane components (hostnames via edenprairie DNS)
+      - job_name: 'kube-etcd'
+        scheme: http
+        static_configs:
+          - targets:
+            - 'duluth.infra.homelab.invalid:2381'
+            - 'bemidji.infra.homelab.invalid:2381'
+            - 'fargo.infra.homelab.invalid:2381'
+
+      # No kube-proxy scrape target: Cilium's kubeProxyReplacement owns service
+      # routing, so nothing listens on :10249.
+
+alertmanager:
+  enabled: true
+  # Without this block the chart routes every alert to a "null" receiver, so
+  # alerts fire silently. Plaintext SMTP auth on the trusted LAN; the bridge
+  # password comes from the alertmanager-smtp secret.
+  config:
+    global:
+      resolve_timeout: 5m
+      smtp_from: notifications@homelab.invalid
+      smtp_smarthost: edenprairie.infra.homelab.invalid:11025
+      smtp_hello: alertmanager
+      smtp_auth_username: notifications@homelab.invalid
+      smtp_auth_identity: notifications@homelab.invalid
+      smtp_auth_password_file: /etc/alertmanager/secrets/alertmanager-smtp/smtp-password
+      # STARTTLS required: Go's SMTP client refuses PLAIN auth on an unencrypted
+      # connection. The bridge presents an internal step-ca cert, verified against
+      # the mounted step-ca root (see the email receiver's tls_config).
+      smtp_require_tls: true
+    route:
+      group_by: ['alertname', 'namespace']
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      receiver: email
+      routes:
+        # Watchdog fires forever by design; pinging healthchecks.io with it
+        # proves the whole chain (rule eval -> Alertmanager -> egress) is
+        # alive - the one path no Prometheus rule can watch. InfoInhibitor
+        # is plumbing and goes nowhere.
+        - receiver: deadman
+          matchers:
+            - 'alertname = "Watchdog"'
+          group_wait: 0s
+          # under the healthchecks.io grace period, so a dead pipeline pages
+          repeat_interval: 10m
+        - receiver: "null"
+          matchers:
+            - 'alertname = "InfoInhibitor"'
+    receivers:
+      - name: "null"
+      - name: deadman
+        webhook_configs:
+          - url_file: /etc/alertmanager/secrets/alertmanager-deadman/ping-url
+            send_resolved: false
+      - name: email
+        email_configs:
+          - to: admin@homelab.invalid
+            send_resolved: true
+            require_tls: true
+            tls_config:
+              ca_file: /etc/alertmanager/configmaps/step-ca-root/ca.pem
+              server_name: edenprairie.infra.homelab.invalid
+    inhibit_rules:
+      - source_matchers: ['severity = "critical"']
+        target_matchers: ['severity =~ "warning|info"']
+        equal: ['namespace', 'alertname']
+      - source_matchers: ['severity = "warning"']
+        target_matchers: ['severity = "info"']
+        equal: ['namespace', 'alertname']
+      - source_matchers: ['alertname = "InfoInhibitor"']
+        target_matchers: ['severity = "info"']
+        equal: ['namespace']
+  alertmanagerSpec:
+    retention: 120h
+    # Mount the bridge SMTP password secret at
+    # /etc/alertmanager/secrets/alertmanager-smtp/smtp-password
+    secrets:
+      - alertmanager-smtp
+      - alertmanager-deadman
+    # Mount the step-ca root CA at
+    # /etc/alertmanager/configmaps/step-ca-root/ca.pem (to verify the bridge cert)
+    configMaps:
+      - step-ca-root
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        memory: 128Mi
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: longhorn
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 1Gi
+
+grafana:
+  enabled: true
+  # Recreate, not RollingUpdate: persistence is a ReadWriteOnce Longhorn volume,
+  # so a new pod cannot start while the old one holds it and RollingUpdate
+  # deadlocks. Appears to work only while replacements land on the same node.
+  deploymentStrategy:
+    type: Recreate
+  adminPassword: "" # set via existing secret below
+  # Rotating this secret is not enough: Grafana applies the admin password only
+  # when it first provisions the user; afterwards the DB wins and updating the
+  # secret looks successful while changing nothing. Reset explicitly:
+  #   kubectl -n monitoring exec <grafana-pod> -c grafana -- \
+  #     grafana cli --homepath=/usr/share/grafana admin reset-admin-password '<pw>'
+  # Then test it, rather than assuming the rollout applied it.
+  admin:
+    existingSecret: grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
+  # ONE sidecar block: this file ships verbatim into a ConfigMap, so a
+  # duplicate key is resolved by the YAML parser (last wins), silently
+  # discarding the other block. No env overrides: the sidecar provisions by
+  # writing files, which needs no grafana API auth.
+  sidecar:
+    dashboards:
+      enabled: true
+      searchNamespace: ALL
+  grafana.ini:
+    server:
+      domain: grafana.homelab.invalid
+    auth.proxy:
+      enabled: true
+      header_name: Remote-User
+      header_property: username
+      auto_sign_up: true
+    auth.basic:
+      enabled: true
+    users:
+      auto_assign_org: true
+      auto_assign_org_role: Admin
+  persistence:
+    enabled: true
+    storageClassName: longhorn
+    size: 2Gi
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+  ingress:
+    enabled: true
+    ingressClassName: traefik
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+      traefik.ingress.kubernetes.io/router.middlewares: external-authelia@kubernetescrd
+    hosts:
+      - grafana.homelab.invalid
+    tls:
+      - secretName: grafana-tls
+        hosts:
+          - grafana.homelab.invalid
+  defaultDashboardsEnabled: true
+  defaultDashboardsTimezone: UTC
+  additionalDataSources:
+    - name: Loki
+      type: loki
+      url: https://loki.monitoring.svc.cluster.local:3100
+      access: proxy
+      isDefault: false
+      jsonData:
+        maxLines: 1000
+        tlsAuthWithCACert: true
+      secureJsonData:
+        tlsCACert: |
+          -----BEGIN CERTIFICATE-----
+          MIIBeDCCAR2gAwIBAgIQQqi4uAY7KHiIuvlRDPnOJTAKBggqhkjOPQQDAjAaMRgw
+          FgYDVQQDEw9Ib21lbGFiIFJvb3QgQ0EwHhcNMjYwODE1MTY1NzAzWhcNMzYwODEy
+          MTY1NzAzWjAaMRgwFgYDVQQDEw9Ib21lbGFiIFJvb3QgQ0EwWTATBgcqhkjOPQIB
+          BggqhkjOPQMBBwNCAATib/q+TApFkAaA3sC5VPsj5YPB6jwEoJtTjdt3MUFOnyOq
+          bithKf178JG2RQTfW2LJ+OoKFKuLpIBHR38aLV+Fo0UwQzAOBgNVHQ8BAf8EBAMC
+          AQYwEgYDVR0TAQH/BAgwBgEB/wIBATAdBgNVHQ4EFgQU4eV7bCem/jdWh/BxYx6M
+          IHwSL3kwCgYIKoZIzj0EAwIDSQAwRgIhAMzf35eBBG+p/hks91wiDqwfkoEeo/Po
+          KEi6wCvsfKEYAiEA/p8AQ3endevYuXKvm0voBDsXAaPudvb2+PvslUkamMk=
+          -----END CERTIFICATE-----
+
+nodeExporter:
+  enabled: true
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      memory: 64Mi
+
+# The hosts' cert-metrics timer writes into this directory; without the mount
+# the cert expiry alerts have no data from the k8s nodes.
+prometheus-node-exporter:
+  extraArgs:
+    - --collector.textfile.directory=/host/textfile
+  extraHostVolumeMounts:
+    - name: textfile
+      hostPath: /var/lib/node-exporter-textfile
+      mountPath: /host/textfile
+      readOnly: true
+
+kubeStateMetrics:
+  enabled: true
+
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
+
+  # `gotk_reconcile_condition`, which nearly every Flux alerting example online
+  # uses, does not exist in Flux 2.x - per-object Ready moved to
+  # kube-state-metrics custom-resource-state.
+  # rbac.extraRules matters: KSM's default ClusterRole cannot read Flux
+  # CRDs and the collector then silently produces nothing. A wrong
+  # group/version fails silently too.
+  rbac:
+    extraRules:
+      - apiGroups: ["kustomize.toolkit.fluxcd.io"]
+        resources: ["kustomizations"]
+        verbs: ["list", "watch"]
+      - apiGroups: ["helm.toolkit.fluxcd.io"]
+        resources: ["helmreleases"]
+        verbs: ["list", "watch"]
+      - apiGroups: ["source.toolkit.fluxcd.io"]
+        resources: ["gitrepositories", "helmrepositories", "helmcharts", "ocirepositories"]
+        verbs: ["list", "watch"]
+
+  customResourceState:
+    enabled: true
+    config:
+      spec:
+        resources:
+          - groupVersionKind:
+              group: kustomize.toolkit.fluxcd.io
+              version: v1
+              kind: Kustomization
+            metricNamePrefix: gotk
+            metrics: &fluxReadyMetric
+              - name: resource_info
+                help: "Flux resource Ready condition and suspend state"
+                each:
+                  type: Info
+                  info:
+                    # "[type=Ready]" selects the condition by its type field,
+                    # conditions are a list, so it cannot be indexed by name.
+                    labelsFromPath:
+                      name: [metadata, name]
+                      exported_namespace: [metadata, namespace]
+                      ready: [status, conditions, "[type=Ready]", status]
+                      suspended: [spec, suspend]
+          - groupVersionKind:
+              group: helm.toolkit.fluxcd.io
+              version: v2
+              kind: HelmRelease
+            metricNamePrefix: gotk
+            metrics: *fluxReadyMetric
+          - groupVersionKind:
+              group: source.toolkit.fluxcd.io
+              version: v1
+              kind: GitRepository
+            metricNamePrefix: gotk
+            metrics: *fluxReadyMetric
+          - groupVersionKind:
+              group: source.toolkit.fluxcd.io
+              version: v1
+              kind: HelmRepository
+            metricNamePrefix: gotk
+            metrics: *fluxReadyMetric
+
+# NixOS uses non-standard ports; all 3 nodes are identical control-plane members.
+# etcd is scraped via additionalScrapeConfigs (hostname-friendly, plain HTTP).
+# controller-manager and scheduler require chart Endpoints (RBAC auth via ServiceMonitor).
+
+kubeEtcd:
+  enabled: false
+
+kubeControllerManager:
+  enabled: true
+  endpoints:
+    # BEGIN nodeips: nix run .#regenerate-manifests overwrites this block from cluster.json
+    - 192.168.1.195
+    - 192.168.1.196
+    - 192.168.1.197
+    # END nodeips
+  service:
+    port: 10257
+    targetPort: 10257
+  serviceMonitor:
+    https: true
+    insecureSkipVerify: true
+
+kubeScheduler:
+  enabled: true
+  endpoints:
+    # BEGIN nodeips: nix run .#regenerate-manifests overwrites this block from cluster.json
+    - 192.168.1.195
+    - 192.168.1.196
+    - 192.168.1.197
+    # END nodeips
+  service:
+    port: 10259
+    targetPort: 10259
+  serviceMonitor:
+    https: true
+    insecureSkipVerify: true
+
+kubeProxy:
+  enabled: false
+
+# CoreDNS (k8s/coredns/, plain manifest) exposes prometheus on port 10055
+coreDns:
+  enabled: true
+  service:
+    port: 10055
+    targetPort: 10055
+
+prometheusOperator:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi

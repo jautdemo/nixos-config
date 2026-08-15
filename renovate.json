@@ -1,0 +1,101 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard"
+  ],
+  "timezone": "UTC",
+  "flux": {
+    "managerFilePatterns": [
+      "/flux/releases/.+\\.yaml$/",
+      "/flux/clusters/.+/gotk-components\\.yaml$/"
+    ]
+  },
+  "kubernetes": {
+    "managerFilePatterns": [
+      "/k8s/.+\\.yaml$/"
+    ]
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "node_exporter pinned in the DSM restore script. Renovate bumps only the version; NODE_EXPORTER_SHA256 on the next line must be updated by hand from the release's sha256sums.txt before merging.",
+      "managerFilePatterns": [
+        "/scripts/dsm/nas-boot-restore\\.sh$/"
+      ],
+      "matchStrings": [
+        "NODE_EXPORTER_VERSION=\"(?<currentValue>[\\d.]+)\""
+      ],
+      "depNameTemplate": "prometheus/node_exporter",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.+)$"
+    },
+    {
+      "customType": "regex",
+      "description": "Image tags inside flux values files carry no repository key, so the chart default applies; a '# renovate: image=' annotation above the tag names the actual image for update tracking.",
+      "managerFilePatterns": [
+        "/flux/releases/.+-values\\.yaml$/"
+      ],
+      "matchStrings": [
+        "# renovate: image=(?<depName>\\S+)\\n\\s*tag: (?<currentValue>\\S+)"
+      ],
+      "datasourceTemplate": "docker"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Plex 1.43.3 breaks hardware transcode on this deployment; never auto-suggest a bump.",
+      "matchPackageNames": [
+        "/plex/"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Everything else can batch weekly.",
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "all non-major",
+      "schedule": [
+        "before 6am on monday"
+      ]
+    },
+    {
+      "description": "Critical cluster components",
+      "matchPackageNames": [
+        "/cilium/",
+        "/longhorn/",
+        "/cert-manager/",
+        "/fluxcd/"
+      ],
+      "groupName": "cluster-critical (review carefully)",
+      "schedule": [
+        "before 6am on monday"
+      ]
+    },
+    {
+      "description": "Careful with DB upgrades",
+      "matchPackageNames": [
+        "/postgres/",
+        "/mariadb/",
+        "/redis/",
+        "/valkey/"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "groupName": "database majors (migration required)",
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "A flake input bump rolls every host at its next unattended upgrade; gate behind dashboard approval.",
+      "matchManagers": [
+        "nix"
+      ],
+      "groupName": "nix flake inputs (attended only)",
+      "dependencyDashboardApproval": true
+    }
+  ],
+  "prConcurrentLimit": 3
+}

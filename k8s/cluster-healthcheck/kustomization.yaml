@@ -1,0 +1,6 @@
+# No secret of its own: it reads the healthchecks-ping secret already
+# present in this namespace.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - cronjob.yaml

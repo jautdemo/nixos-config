@@ -1,0 +1,144 @@
+# Longhorn polls its backupstore continuously while a target URL is set, which
+# keeps the NAS HDDs spun up. The target is open only 08:00-10:00:
+#   08:00  open    URL + pollInterval 30s
+#   08:05  daily-backup RecurringJob runs; db and secrets jobs follow through 08:50
+#   09:30  the audit verifies the artifacts
+#   10:00  close   blank URL + pollInterval 0s
+# A blank URL outside that window is the idle state, not a fault.
+#
+# Backups and restores only work while the target is open. To restore at any
+# other time, open it by hand first (the same patch the open job below
+# applies).
+---
+# ServiceAccount + RBAC for the backup-window CronJobs
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: backup-window
+  namespace: longhorn-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: backup-window
+  namespace: longhorn-system
+rules:
+  - apiGroups: ["longhorn.io"]
+    resources: ["backuptargets"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: backup-window
+  namespace: longhorn-system
+subjects:
+  - kind: ServiceAccount
+    name: backup-window
+    namespace: longhorn-system
+roleRef:
+  kind: Role
+  name: backup-window
+  apiGroup: rbac.authorization.k8s.io
+---
+# Open. The RecurringJob fires 5 minutes later.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup-window-open
+  namespace: longhorn-system
+spec:
+  # NAS outage 2026-08-13: every run breaks on the dead NFS mount.
+  # Unsuspend when the NAS is back.
+  suspend: true
+  schedule: "0 8 * * *"
+  timeZone: "UTC"
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      # Failures included: only new failures rotate the history out, so one
+      # transient failure would keep KubeJobFailed firing forever.
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          serviceAccountName: backup-window
+          containers:
+            - name: kubectl
+              image: alpine/k8s:1.36.2
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  # `set -e` matters: without it a failed `kubectl patch` still
+                  # reports the Job Complete, and the window never opens.
+                  set -e
+                  kubectl patch backuptarget default -n longhorn-system \
+                    --type=merge \
+                    -p '{"spec":{"backupTargetURL":"nfs://nas.infra.homelab.invalid:/volume1/longhorn-backups","pollInterval":"30s"}}'
+                  # Verify the CR actually holds the value just set, rather
+                  # than trusting `patch`'s exit code alone, a webhook can
+                  # accept a request and still not persist it as expected.
+                  ACTUAL=$(kubectl get backuptarget default -n longhorn-system -o jsonpath='{.spec.backupTargetURL}')
+                  if [ "$ACTUAL" != "nfs://nas.infra.homelab.invalid:/volume1/longhorn-backups" ]; then
+                    echo "FATAL: backupTargetURL is '$ACTUAL' after patch, not the expected NFS path" >&2
+                    exit 1
+                  fi
+
+                  # spec is not what gates backups, status.available is: the validator
+                  # webhook rejects every Backup CREATE until Longhorn has actually
+                  # mounted the NFS share, so checking only the spec proves nothing.
+                  #
+                  # Waiting here also closes the ordering gap to the 08:05 job: a slow or
+                  # broken mount fails LOUDLY now, rather than as missing artifacts a day
+                  # later.
+                  i=0
+                  while [ "$i" -lt 60 ]; do
+                    AVAIL=$(kubectl get backuptarget default -n longhorn-system -o jsonpath='{.status.available}' 2>/dev/null)
+                    [ "$AVAIL" = "true" ] && break
+                    i=$((i + 1))
+                    sleep 5
+                  done
+                  if [ "$AVAIL" != "true" ]; then
+                    echo "FATAL: backup target still not available after 5 minutes (status.available=$AVAIL)" >&2
+                    kubectl get backuptarget default -n longhorn-system -o jsonpath='{.status.conditions}' >&2 || true
+                    exit 1
+                  fi
+                  echo "Backup target enabled and AVAILABLE (pollInterval=30s, took ~$((i * 5))s)"
+          restartPolicy: OnFailure
+---
+# Close (quiet disks).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup-window-close
+  namespace: longhorn-system
+spec:
+  # NAS outage 2026-08-13: every run breaks on the dead NFS mount.
+  # Unsuspend when the NAS is back.
+  suspend: true
+  schedule: "0 10 * * *"
+  timeZone: "UTC"
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      # Failures included: only new failures rotate the history out, so one
+      # transient failure would keep KubeJobFailed firing forever.
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          serviceAccountName: backup-window
+          containers:
+            - name: kubectl
+              image: alpine/k8s:1.36.2
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -e
+                  kubectl patch backuptarget default -n longhorn-system \
+                    --type=merge \
+                    -p '{"spec":{"backupTargetURL":"","pollInterval":"0s"}}'
+                  echo "Backup target disabled (pollInterval=0)"
+          restartPolicy: OnFailure

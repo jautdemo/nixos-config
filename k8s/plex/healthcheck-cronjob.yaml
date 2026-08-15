@@ -1,0 +1,194 @@
+# End-to-end Plex check, every minute. Pod health sees none of these outages:
+# the pod stays Running throughout.
+#   reachable  the LoadBalancer VIP answers /identity
+#   media      /data/media inside the pod is readable and non-empty
+#   remote     the *.plex.direct hostname app.plex.tv uses resolves and
+#              completes a cert-verified request
+#   plex.tv    upstream auth status, informational
+#   prefs      customConnections and PublishServerOnPlexOnlineKey still route
+#              clients here; self-heals via Plex's API
+# Check set to "every 1 minute", grace ~2 min.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: plex-healthcheck
+  namespace: plex
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: plex-healthcheck
+  namespace: plex
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: plex-healthcheck
+  namespace: plex
+subjects:
+  - kind: ServiceAccount
+    name: plex-healthcheck
+    namespace: plex
+roleRef:
+  kind: Role
+  name: plex-healthcheck
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: plex-healthcheck
+  namespace: plex
+spec:
+  schedule: "* * * * *"
+  timeZone: "UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      # Auto-delete finished Jobs after an hour, failed ones included. On a job
+      # that runs every minute and normally succeeds, nothing ever rotates a
+      # failure out, so one failure keeps KubeJobFailed firing until a new
+      # failure replaces it.
+      ttlSecondsAfterFinished: 3600
+      template:
+        spec:
+          serviceAccountName: plex-healthcheck
+          restartPolicy: OnFailure
+          # This job writes nothing, so pin it to nobody rather than
+          # inheriting whatever UID the base image runs as.
+          securityContext:
+            runAsUser: 65534
+            runAsGroup: 65534
+            runAsNonRoot: true
+          containers:
+            - name: healthcheck
+              image: alpine/k8s:1.36.2
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: HC_PING_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: healthchecks-ping
+                      key: ping-key
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -u
+                  # Two pings swallowed by `|| true` flip the check DOWN with every
+                  # sub-check OK, so retry and log loudly. Budget kept SHORT (20s): under
+                  # concurrencyPolicy: Forbid a run over 60s skips the next one.
+                  hc_ping() {
+                    if [ "$FAILED" -eq 0 ]; then
+                      curl -fsS -m10 --retry 3 --retry-delay 2 --retry-all-errors --retry-max-time 20 -o /dev/null --data-raw "$DETAILS" "https://hc-ping.com/${HC_PING_KEY}/plex-healthcheck?create=1" || echo "WARNING: success ping to healthchecks.io FAILED after retries" >&2
+                    else
+                      curl -fsS -m10 --retry 3 --retry-delay 2 --retry-all-errors --retry-max-time 20 -o /dev/null --data-raw "$DETAILS" "https://hc-ping.com/${HC_PING_KEY}/plex-healthcheck/fail?create=1" || echo "WARNING: failure ping to healthchecks.io FAILED after retries" >&2
+                    fi
+                  }
+                  trap hc_ping EXIT
+                  FAILED=0
+                  DETAILS=""
+                  # A real newline: in --data-raw "\n" stays a literal backslash-n.
+                  # $() eats trailing newlines, hence the sentinel.
+                  NL=$(printf '\nx'); NL=${NL%x}
+
+                  POD=$(kubectl get pods -n plex -l app=plex -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+                  VIP=$(kubectl get svc plex -n plex -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+
+                  if [ -z "$POD" ]; then
+                    FAILED=$((FAILED + 1)); DETAILS="${DETAILS}  FAIL no plex pod found${NL}"
+                  fi
+                  if [ -z "$VIP" ]; then
+                    FAILED=$((FAILED + 1)); DETAILS="${DETAILS}  FAIL plex Service has no LoadBalancer IP${NL}"
+                  fi
+
+                  # 1. reachable: plain HTTP to the VIP
+                  if [ -n "$VIP" ]; then
+                    code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 "http://${VIP}:32400/identity" 2>/dev/null)
+                    if [ "$code" = "200" ]; then
+                      DETAILS="${DETAILS}  OK   reachable: http://${VIP}:32400/identity -> 200${NL}"
+                    else
+                      FAILED=$((FAILED + 1)); DETAILS="${DETAILS}  FAIL reachable: http://${VIP}:32400/identity -> ${code:-no response}${NL}"
+                    fi
+                  fi
+
+                  # 2. media: pod can actually read its library mount
+                  if [ -n "$POD" ]; then
+                    if kubectl exec -n plex "$POD" -- sh -c 'test -r /data/media && [ -n "$(ls -A /data/media 2>/dev/null)" ]' >/dev/null 2>&1; then
+                      DETAILS="${DETAILS}  OK   media: /data/media readable and non-empty${NL}"
+                    else
+                      FAILED=$((FAILED + 1)); DETAILS="${DETAILS}  FAIL media: /data/media unreadable or empty inside the pod${NL}"
+                    fi
+                  fi
+
+                  # 3. remote: the *.plex.direct hostname app.plex.tv actually
+                  # uses, with full certificate verification (no -k). This path
+                  # can break while the VIP stays reachable.
+                  if [ -n "$POD" ] && [ -n "$VIP" ]; then
+                    UUID=$(kubectl exec -n plex "$POD" -- grep -oE 'CertificateUUID="[^"]*"' "/config/Library/Application Support/Plex Media Server/Preferences.xml" 2>/dev/null | cut -d'"' -f2)
+                    if [ -n "$UUID" ]; then
+                      DASHED_IP=$(echo "$VIP" | tr '.' '-')
+                      HOST="${DASHED_IP}.${UUID}.plex.direct"
+                      code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "https://${HOST}:32400/identity" 2>/dev/null)
+                      if [ "$code" = "200" ]; then
+                        DETAILS="${DETAILS}  OK   remote: https://${HOST}:32400/identity -> 200 (cert verified)${NL}"
+                      else
+                        FAILED=$((FAILED + 1)); DETAILS="${DETAILS}  FAIL remote: https://${HOST}:32400/identity -> ${code:-no response} (DNS or cert broken - check AdGuard upstream_dns for a resolver stripping private-IP answers)${NL}"
+                      fi
+                    else
+                      FAILED=$((FAILED + 1)); DETAILS="${DETAILS}  FAIL remote: could not read CertificateUUID from Preferences.xml${NL}"
+                    fi
+                  fi
+
+                  # 4. plex.tv's own hosted web app - informational, never a failure: it is
+                  # a Plex cloud dependency this server cannot fix. Included so a mail says
+                  # "it's Plex.tv, not you" rather than sending you after a healthy server.
+                  authStatus=$(curl -sS --max-time 8 "https://status.plex.tv/api/v2/summary.json" 2>/dev/null | grep -o '"name":"Hosted web app (app.plex.tv)"[^}]*' | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
+                  if [ "$authStatus" = "operational" ]; then
+                    DETAILS="${DETAILS}  OK   plex.tv app.plex.tv component: operational${NL}"
+                  else
+                    DETAILS="${DETAILS}  INFO plex.tv app.plex.tv component: ${authStatus:-unknown} (see https://status.plex.tv - may be Plex's own outage, not ours)${NL}"
+                  fi
+
+                  # 5. prefs drift: customConnections and PublishServerOnPlexOnlineKey must
+                  # stay set for plex.tv to route clients here. Self-heals via Plex's API,
+                  # not by editing Preferences.xml, which Plex overwrites while running.
+                  if [ -n "$POD" ] && [ -n "$VIP" ]; then
+                    TOKEN=$(kubectl exec -n plex "$POD" -- grep -oE 'PlexOnlineToken="[^"]*"' "/config/Library/Application Support/Plex Media Server/Preferences.xml" 2>/dev/null | cut -d'"' -f2)
+                    if [ -n "$TOKEN" ]; then
+                      EXPECT="https://${VIP}:32400"
+                      CUR_CONN=$(kubectl exec -n plex "$POD" -- grep -oE 'customConnections="[^"]*"' "/config/Library/Application Support/Plex Media Server/Preferences.xml" 2>/dev/null | cut -d'"' -f2)
+                      if [ "$CUR_CONN" = "$EXPECT" ]; then
+                        DETAILS="${DETAILS}  OK   prefs: customConnections correct${NL}"
+                      else
+                        ENC=$(echo -n "$EXPECT" | sed 's/:/%3A/g; s#/#%2F#g')
+                        kubectl exec -n plex "$POD" -- curl -sS -X PUT "http://127.0.0.1:32400/:/prefs?customConnections=${ENC}&X-Plex-Token=${TOKEN}" -o /dev/null 2>/dev/null
+                        FAILED=$((FAILED + 1)); DETAILS="${DETAILS}  FAIL prefs: customConnections was '${CUR_CONN}', expected '${EXPECT}' - re-applied${NL}"
+                      fi
+                      CUR_PUB=$(kubectl exec -n plex "$POD" -- grep -oE 'PublishServerOnPlexOnlineKey="[^"]*"' "/config/Library/Application Support/Plex Media Server/Preferences.xml" 2>/dev/null | cut -d'"' -f2)
+                      if [ "$CUR_PUB" = "1" ]; then
+                        DETAILS="${DETAILS}  OK   prefs: PublishServerOnPlexOnlineKey=1${NL}"
+                      else
+                        kubectl exec -n plex "$POD" -- curl -sS -X PUT "http://127.0.0.1:32400/:/prefs?PublishServerOnPlexOnlineKey=1&X-Plex-Token=${TOKEN}" -o /dev/null 2>/dev/null
+                        FAILED=$((FAILED + 1)); DETAILS="${DETAILS}  FAIL prefs: PublishServerOnPlexOnlineKey was '${CUR_PUB}' - re-applied${NL}"
+                      fi
+                    else
+                      FAILED=$((FAILED + 1)); DETAILS="${DETAILS}  FAIL prefs: could not read PlexOnlineToken${NL}"
+                    fi
+                  fi
+
+                  printf '%s' "$DETAILS"
+
+                  # Exit 0 even when checks failed: the /fail ping IS the signal. Exiting
+                  # non-zero also fails the Job, tripping KubeJobFailed and mailing the same
+                  # incident twice. A silently dying checker is covered by the EXIT trap.
+                  exit 0

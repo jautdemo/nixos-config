@@ -1,0 +1,141 @@
+{
+    "gateway": "192.168.1.1",
+    "dns": "192.168.1.193",
+    "prefix": 24,
+    "nodes": {
+        "duluth": "192.168.1.195",
+        "bemidji": "192.168.1.196",
+        "fargo": "192.168.1.197"
+    },
+    "sshKeys": {
+        "yubikey-c": "no-touch-required sk-ssh-ed25519@openssh.com AAAADEADBEEF09DEADBEEF09DEADBEEF09DEADBEEF09DEADBEEF09DEADBEEF09= yubikey-c-deadbeef",
+        "yubikey-d": "no-touch-required sk-ssh-ed25519@openssh.com AAAADEADBEEF08DEADBEEF08DEADBEEF08DEADBEEF08DEADBEEF08DEADBEEF08= yubikey-d-deadbeef"
+    },
+    "infra": {
+        "edenprairie": "192.168.1.193",
+        "nas": "192.168.1.194",
+        "nasSshPort": 11235,
+        "nasUser": "root",
+        "brainerd": "brainerd.homelab.invalid"
+    },
+    "apiVIP": "192.168.1.209",
+    "podCidr": "10.2.0.0/16",
+    "serviceCidr": "10.0.0.0/24",
+    "kubeDns": "10.0.0.254",
+    "allowedRegistries": ["docker.io", "quay.io", "ghcr.io", "registry.k8s.io", "cr.step.sm"],
+    "healthchecks": {
+        "alertmanager-watchdog": {
+            "grace": 900,
+            "timeout": 1800
+        },
+        "backup-audit": {
+            "grace": 7200,
+            "schedule": "30 9 * * *",
+            "tz": "UTC"
+        },
+        "bemidji": {
+            "grace": 600,
+            "timeout": 60
+        },
+        "brainerd-edge": {
+            "grace": 600,
+            "timeout": 60
+        },
+        "cluster-healthcheck": {
+            "grace": 720,
+            "timeout": 300
+        },
+        "doh": {
+            "grace": 600,
+            "timeout": 60
+        },
+        "dot": {
+            "grace": 600,
+            "timeout": 60
+        },
+        "duluth": {
+            "grace": 600,
+            "timeout": 60
+        },
+        "edenprairie": {
+            "grace": 600,
+            "timeout": 60
+        },
+        "fargo": {
+            "grace": 600,
+            "timeout": 60
+        },
+        "immich-backup": {
+            "grace": 900,
+            "schedule": "*/5 * * * *",
+            "tz": "UTC"
+        },
+        "mumble": {
+            "grace": 600,
+            "timeout": 60
+        },
+        "nas": {
+            "grace": 600,
+            "timeout": 60
+        },
+        "origin-lock": {
+            "grace": 600,
+            "timeout": 60
+        },
+        "plex-healthcheck": {
+            "grace": 180,
+            "timeout": 60
+        },
+        "web": {
+            "grace": 600,
+            "timeout": 60
+        }
+    },
+    "internalServices": {
+        "devices": {
+            "nas": { "title": "NAS - Synology DSM", "ip": "192.168.1.194", "port": 5000 },
+            "netgearswitch": { "title": "Netgear Switch", "ip": "192.168.1.136", "port": 80 },
+            "zyxelrepeater": { "title": "Zyxel Repeater", "ip": "192.168.1.189", "port": 80 },
+            "zyxelrouter": { "title": "Zyxel Router", "ip": "192.168.1.1", "port": 80 },
+            "zyxelswitch": { "title": "Zyxel Switch", "ip": "192.168.1.111", "port": 80 }
+        },
+        "cluster": ["longhorn"]
+    },
+    "wireguard": {
+        "brainerd": {
+            "publicKey": "deadbeef06deadbeef06deadbeef06deadbeef06dea=",
+            "ip": "10.8.0.1"
+        },
+        "gateway": {
+            "publicKey": "deadbeef01deadbeef01deadbeef01deadbeef01dea=",
+            "ip": "10.8.0.2"
+        }
+    },
+    "loadBalancer": {
+        "pool": "192.168.1.220-192.168.1.229",
+        "vips": {
+            "traefik": "192.168.1.220",
+            "adguard": "192.168.1.221",
+            "mumble": "192.168.1.223",
+            "plex": "192.168.1.224",
+            "syslog": "192.168.1.225",
+            "loki": "192.168.1.226"
+        }
+    },
+    "backupRecipients": [
+        "age1yubikey1deadbeef04deadbeef04deadbeef04deadbeef04deadbe",
+        "age1yubikey1deadbeef05deadbeef05deadbeef05deadbeef05deadbe",
+        "age1deadbeef02deadbeef02deadbeef02deadbeef02deadbeef02dead"
+    ],
+    "clusterBackupRecipients": [
+        "age1deadbeef02deadbeef02deadbeef02deadbeef02deadbeef02dead",
+        "ssh-ed25519 AAAADEADBEEF10DEADBEEF10DEADBEEF10DEADBEEF10DEADBEEF10DEADBEEF10="
+    ],
+    "hostKeys": {
+        "duluth": "ssh-ed25519 AAAADEADBEEF12DEADBEEF12DEADBEEF12DEADBEEF12DEADBEEF12DEADBEEF12=",
+        "bemidji": "ssh-ed25519 AAAADEADBEEF15DEADBEEF15DEADBEEF15DEADBEEF15DEADBEEF15DEADBEEF15=",
+        "fargo": "ssh-ed25519 AAAADEADBEEF11DEADBEEF11DEADBEEF11DEADBEEF11DEADBEEF11DEADBEEF11=",
+        "edenprairie": "ssh-ed25519 AAAADEADBEEF10DEADBEEF10DEADBEEF10DEADBEEF10DEADBEEF10DEADBEEF10=",
+        "brainerd": "ssh-ed25519 AAAADEADBEEF14DEADBEEF14DEADBEEF14DEADBEEF14DEADBEEF14DEADBEEF14="
+    }
+}

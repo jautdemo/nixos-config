@@ -1,0 +1,17 @@
+# step-issuer, links cert-manager to the step-ca JWK provisioner "k8s".
+# Allows cert-manager Certificate resources to request certs with
+# arbitrary SANs (internal hostnames, IPs) via step-ca.
+apiVersion: certmanager.step.sm/v1beta1
+kind: StepClusterIssuer
+metadata:
+  name: step-ca
+spec:
+  url: https://edenprairie.infra.homelab.invalid:8443
+  caBundle: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUJlRENDQVIyZ0F3SUJBZ0lRUXFpNHVBWTdLSGlJdXZsUkRQbk9KVEFLQmdncWhrak9QUVFEQWpBYU1SZ3cKRmdZRFZRUURFdzlJYjIxbGJHRmlJRkp2YjNRZ1EwRXdIaGNOTWpZd09ERTFNVFkxTnpBeldoY05Nell3T0RFeQpNVFkxTnpBeldqQWFNUmd3RmdZRFZRUURFdzlJYjIxbGJHRmlJRkp2YjNRZ1EwRXdXVEFUQmdjcWhrak9QUUlCCkJnZ3Foa2pPUFFNQkJ3TkNBQVRpYi9xK1RBcEZrQWFBM3NDNVZQc2o1WVBCNmp3RW9KdFRqZHQzTVVGT255T3EKYml0aEtmMTc4SkcyUlFUZlcyTEorT29LRkt1THBJQkhSMzhhTFYrRm8wVXdRekFPQmdOVkhROEJBZjhFQkFNQwpBUVl3RWdZRFZSMFRBUUgvQkFnd0JnRUIvd0lCQVRBZEJnTlZIUTRFRmdRVTRlVjdiQ2VtL2pkV2gvQnhZeDZNCklId1NMM2t3Q2dZSUtvWkl6ajBFQXdJRFNRQXdSZ0loQU16ZjM1ZUJCRytwL2hrczkxd2lEcXdma29FZW8vUG8KS0VpNndDdnNmS0VZQWlFQS9wOEFRM2VuZGV2WXVYS3ZtMHZvQkRzWEFhUHVkdmIyK1B2c2xVa2FtTWs9Ci0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0K
+  provisioner:
+    name: k8s
+    kid: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef041
+    passwordRef:
+      namespace: cert-manager
+      name: step-ca-provisioner-password
+      key: password

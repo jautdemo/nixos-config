@@ -1,0 +1,65 @@
+# Cilium: the CNI, the service datapath and the LB.
+#
+# L2 announcements are beta. Leader election is per-Service and ignores
+# externalTrafficPolicy, so a `Local` LoadBalancer needs a pod on every node or
+# an election can land somewhere with no backend and blackhole the VIP.
+# cluster-healthcheck check 8b watches for that.
+
+cluster:
+  name: homelab
+
+# Reach the API server directly, so Cilium does not depend on the service
+# datapath it is itself providing.
+# BEGIN apiserver: nix run .#regenerate-manifests overwrites this block from cluster.json
+k8sServiceHost: 192.168.1.209
+# END apiserver
+k8sServicePort: 6443
+
+ipam:
+  mode: cluster-pool
+  operator:
+    # BEGIN podcidr: nix run .#regenerate-manifests overwrites this block from cluster.json
+    clusterPoolIPv4PodCIDRList: ["10.2.0.0/16"]
+    # END podcidr
+    clusterPoolIPv4MaskSize: 24
+
+routingMode: tunnel
+tunnelProtocol: geneve
+
+# Required by l2announcements below: Cilium cannot ARP-reply for service IPs
+# without owning the service datapath.
+kubeProxyReplacement: true
+
+# Raised for L2 announcements, which add API server traffic beyond what the
+# defaults allow for.
+k8sClientRateLimit:
+  qps: 50
+  burst: 100
+
+policyEnforcementMode: default
+policyAuditMode: false
+
+cni:
+  install: true
+  # Cilium writes its conf to a path only Cilium-managed kubelets read
+  exclusive: false
+  confPath: /var/lib/cni/conf
+  binPath: /opt/cni/bin
+
+l2announcements:
+  enabled: true
+externalIPs:
+  enabled: true
+bgpControlPlane:
+  enabled: false
+
+hubble:
+  enabled: true
+  relay:
+    enabled: true
+
+operator:
+  replicas: 1
+  # Defaults to true, which restarts every pod the operator does not manage.
+  unmanagedPodWatcher:
+    restart: false

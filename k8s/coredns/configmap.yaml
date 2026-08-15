@@ -1,0 +1,40 @@
+# Listens on 10053 (unprivileged); the kube-dns Service maps 53 -> 10053.
+# The forward target is edenprairie's dnsmasq (generated from cluster.json).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns
+  namespace: kube-system
+  labels:
+    k8s-app: kube-dns
+data:
+  Corefile: |
+    .:10053 {
+      errors
+      # TEMPORARY. DELETE with k8s/egress-observer/ once the toFQDNs allowlists
+      # are written. The destinations are rotating CDN addresses,
+      # so the policy needs NAMES, which the IP-only observer cannot give.
+      # Not Cilium's L7 DNS proxy: any egress rule flips the endpoint to
+      # enforced default-deny, and one missing allow takes the namespace down.
+      # Blind spots: hostNetwork pods, cluster-healthcheck (dnsPolicy: None),
+      # and any DoH client never ask CoreDNS at all.
+      log
+      health :10054
+      # Backs the Deployment's readinessProbe: returns 200 only once every
+      # plugin reports ready. Without it a crashlooping pod counts as Ready
+      # the instant its container starts, and maxUnavailable stops protecting
+      # anything.
+      ready :10056
+      kubernetes cluster.local in-addr.arpa ip6.arpa {
+        pods insecure
+        fallthrough in-addr.arpa ip6.arpa
+      }
+      prometheus :10055
+      # BEGIN forward: nix run .#regenerate-manifests overwrites this block from cluster.json
+      forward . 192.168.1.193
+      # END forward
+      cache 30
+      loop
+      reload
+      loadbalance
+    }

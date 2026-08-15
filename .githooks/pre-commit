@@ -1,0 +1,12 @@
+#!/bin/sh
+# Reject staged nix files that nixfmt would change; CI enforces the same.
+# One-time activation per clone: git config core.hooksPath .githooks
+set -eu
+files=$(git diff --cached --name-only --diff-filter=ACM -- '*.nix')
+[ -n "$files" ] || exit 0
+# shellcheck disable=SC2086
+if ! nix run nixpkgs#nixfmt-rfc-style -- --check $files; then
+  echo "unformatted nix files; fix with:" >&2
+  echo "  nix run nixpkgs#nixfmt-rfc-style -- $files" >&2
+  exit 1
+fi

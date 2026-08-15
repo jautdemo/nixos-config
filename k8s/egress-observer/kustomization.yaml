@@ -1,0 +1,6 @@
+# TEMPORARY: remove this whole directory and its parent kustomization entry
+# once the egress policies it exists to inform are written and enforcing.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml

@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: secrets-backup-nfs
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  mountOptions:
+    - nfsvers=4.1
+    - sec=sys
+    - hard
+    - intr
+    - noatime
+  nfs:
+    server: nas.infra.homelab.invalid
+    path: /volume1/longhorn-backups/secrets-backup
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: secrets-backup-nfs
+  namespace: secrets-backup
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: ""
+  volumeName: secrets-backup-nfs
+  resources:
+    requests:
+      storage: 1Gi

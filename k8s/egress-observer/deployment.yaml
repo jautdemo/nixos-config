@@ -1,0 +1,69 @@
+# TEMPORARY: evidence for the egress NetworkPolicy work. DELETE once those
+# policies enforce. Query: {namespace="egress-observer"}
+#
+# Not Cilium's policy-audit-mode, which is cluster-wide and would stop enforcing
+# the ingress policies that work today.
+# Follows continuously because nightly CronJobs and cert renewals never show up
+# in a short sample. Dedup is on namespace+WORKLOAD identity, so repeated
+# CronJob runs collapse into one source instead of minting a new one per pod.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: egress-observer
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: egress-observer
+  namespace: egress-observer
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: egress-observer }
+  template:
+    metadata:
+      labels: { app: egress-observer }
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 65534
+        runAsGroup: 65534
+        runAsNonRoot: true
+      containers:
+        - name: observer
+          # The cilium agent image carries the hubble CLI and jq, and is
+          # already present on every node, so this pulls nothing new.
+          image: quay.io/cilium/cilium:v1.20.0
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              RELAY="hubble-relay.kube-system.svc.cluster.local:80"
+              echo "egress-observer: following all flows via $RELAY"
+              echo "egress-observer: printing each distinct src -> dst:port/proto once"
+              # --follow reconnects on relay restarts; the outer loop covers the
+              # case where it gives up entirely (relay redeployed, node reboot).
+              while true; do
+                # JSON, not the compact rendering: workload identity is a real
+                # field there, so every pod of a CronJob or Deployment dedups
+                # to one line where pod names would each mint a new source.
+                # Endpoints without a namespace (world, host) render as the
+                # bare IP. The seen-map is per-process, so a restart re-emits
+                # the list, which is useful, it re-baselines rather than going
+                # silent; fflush because a rare distinct line must not sit in
+                # a block buffer.
+                hubble observe --server "$RELAY" --follow --type trace -o json 2>/dev/null \
+                  | jq -r --unbuffered '
+                      def epname(ep; ip):
+                        if ep.namespace then "\(ep.namespace)/\(ep.workloads[0].name // ep.pod_name)" else ip end;
+                      .flow? // empty
+                      | (.l4 // {} | keys_unsorted[0] // "") as $proto
+                      | (.l4[$proto].destination_port // "") as $port
+                      | "\(epname(.source; .IP.source)) -> \(epname(.destination; .IP.destination)):\($port)/\($proto)"' \
+                  | awk '!seen[$0]++ { print; fflush() }'
+                echo "egress-observer: hubble stream ended, reconnecting in 30s" >&2
+                sleep 30
+              done
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+            limits: { memory: 256Mi }

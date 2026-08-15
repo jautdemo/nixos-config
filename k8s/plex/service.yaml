@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: plex
+  namespace: plex
+  annotations:
+    # BEGIN vip: nix run .#regenerate-manifests overwrites this block from cluster.json
+    lbipam.cilium.io/ips: "192.168.1.224"
+    # END vip
+spec:
+  type: LoadBalancer
+  # Cluster, not Local. Plex can only run one replica, and Cilium's
+  # L2-announcement election ignores externalTrafficPolicy, so under Local,
+  # every reschedule risks the lease not following the pod and blackholing the
+  # VIP. Cluster makes any node route correctly, so the election stops mattering.
+  # The usual cost is losing the client source IP, which does not matter here:
+  # ALLOWED_NETWORKS in the deployment already covers the pod CIDR.
+  externalTrafficPolicy: Cluster
+  selector:
+    app: plex
+  ports:
+    - name: plex
+      port: 32400
+      targetPort: 32400
+      protocol: TCP

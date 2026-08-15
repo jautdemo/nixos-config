@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: plex-nfs-media
+spec:
+  capacity:
+    storage: 10Ti
+  accessModes:
+    - ReadOnlyMany
+  persistentVolumeReclaimPolicy: Retain
+  mountOptions:
+    - nfsvers=4.1
+    - sec=krb5
+    - rsize=1048576
+    - wsize=1048576
+    - hard
+    - intr
+    - noatime
+    - nocto
+    - tcp
+  nfs:
+    server: nas.infra.homelab.invalid
+    path: /volume1/data/media
+    readOnly: true
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: plex-nfs-media
+  namespace: plex
+spec:
+  accessModes:
+    - ReadOnlyMany
+  storageClassName: ""
+  volumeName: plex-nfs-media
+  resources:
+    requests:
+      storage: 10Ti

@@ -1,0 +1,64 @@
+# Immich, self-hosted photo backup.
+
+controllers:
+  main:
+    pod:
+      # Must match the immich@HOMELAB.INVALID ccache UID so rpc.gssd finds the
+      # right credential for the NFS-mounted library.
+      securityContext:
+        runAsUser: 11003
+        runAsGroup: 11003
+        fsGroup: 11003
+    containers:
+      main:
+        image:
+          # renovate: image=ghcr.io/immich-app/immich-server
+          tag: v3.0.0
+        env:
+          REDIS_HOSTNAME: '{{ printf "%s-valkey" .Release.Name }}'
+          DB_HOSTNAME: immich-postgres.immich.svc
+          DB_USERNAME: immich
+          DB_DATABASE_NAME: immich
+          DB_PASSWORD:
+            valueFrom:
+              secretKeyRef:
+                name: immich-postgres
+                key: password
+
+immich:
+  persistence:
+    library:
+      existingClaim: immich-library
+  # Full config (trash + OAuth, including the client secret) lives in the
+  # sops-encrypted immich-config Secret (k8s/immich/config-secret.yaml).
+  # Mutually exclusive with the inline `configuration:` key.
+  configurationKind: Secret
+  existingConfiguration: immich-config
+
+valkey:
+  enabled: true
+
+server:
+  enabled: true
+  ingress:
+    main:
+      enabled: true
+      className: traefik
+      annotations:
+        cert-manager.io/cluster-issuer: letsencrypt-prod
+        # No Authelia forward-auth middleware here on purpose: Immich has its
+        # own OIDC login against Authelia, so stacking forward-auth in front
+        # would be a second, redundant login.
+      hosts:
+        - host: photos.homelab.invalid
+          paths:
+            - path: "/"
+              service:
+                identifier: main
+      tls:
+        - secretName: photos-tls
+          hosts:
+            - photos.homelab.invalid
+
+machine-learning:
+  enabled: false

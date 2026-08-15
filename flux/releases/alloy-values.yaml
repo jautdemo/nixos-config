@@ -1,0 +1,144 @@
+# Alloy: k8s log collection + syslog receiver for the NAS.
+
+crds:
+  create: false
+
+# Align config-reloader with kube-prometheus-stack's prometheus-operator version
+configReloader:
+  image:
+    # renovate: image=quay.io/prometheus-operator/prometheus-config-reloader
+    tag: v0.90.1
+
+controller:
+  type: daemonset
+  volumes:
+    extra:
+      # The generated ConfigMap, never a hand-made Secret: this must track a CA
+      # rotation, or alloy cannot verify the apiserver and all pod logging stops
+      # with nothing reporting it. Mapped to ca.crt to keep the filename below.
+      - name: step-ca-root-ca
+        configMap:
+          name: step-ca-root
+          items:
+            - key: ca.pem
+              path: ca.crt
+      - name: loki-tls
+        secret:
+          secretName: loki-tls
+
+alloy:
+  mounts:
+    varlog: true
+    extra:
+      - name: step-ca-root-ca
+        mountPath: /etc/alloy/ca
+        readOnly: true
+      - name: loki-tls
+        mountPath: /etc/alloy/tls
+        readOnly: true
+  extraPorts:
+    - name: tcp-syslog
+      port: 1514
+      targetPort: 1514
+      protocol: TCP
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+  configMap:
+    content: |-
+      // -- Kubernetes pod logs --
+      discovery.kubernetes "pods" {
+        role = "pod"
+      }
+
+      discovery.relabel "pods" {
+        targets = discovery.kubernetes.pods.targets
+
+        rule {
+          source_labels = ["__meta_kubernetes_namespace"]
+          target_label  = "namespace"
+        }
+        rule {
+          source_labels = ["__meta_kubernetes_pod_name"]
+          target_label  = "pod"
+        }
+        rule {
+          source_labels = ["__meta_kubernetes_pod_container_name"]
+          target_label  = "container"
+        }
+        rule {
+          source_labels = ["__meta_kubernetes_namespace", "__meta_kubernetes_pod_name"]
+          separator     = "/"
+          target_label  = "job"
+        }
+        rule {
+          source_labels = ["__meta_kubernetes_pod_name"]
+          action        = "keep"
+          regex         = ".+"
+        }
+      }
+
+      loki.source.kubernetes "pods" {
+        targets    = discovery.relabel.pods.output
+        forward_to = [loki.write.loki.receiver]
+      }
+
+      // -- Kubernetes events --
+      loki.source.kubernetes_events "events" {
+        forward_to = [loki.write.loki.receiver]
+      }
+
+      // -- TLS syslog receiver (NAS + other infra) --
+      loki.source.syslog "syslog" {
+        listener {
+          address               = "0.0.0.0:1514"
+          protocol              = "tcp"
+          idle_timeout          = "120s"
+          label_structured_data = true
+          tls_config {
+            cert_file = "/etc/alloy/tls/tls.crt"
+            key_file  = "/etc/alloy/tls/tls.key"
+          }
+          labels = {
+            job = "syslog",
+          }
+        }
+        forward_to = [loki.relabel.syslog.receiver]
+      }
+
+      loki.relabel "syslog" {
+        rule {
+          source_labels = ["__syslog_message_hostname"]
+          target_label  = "host"
+        }
+        rule {
+          source_labels = ["__syslog_message_app_name"]
+          target_label  = "app"
+        }
+        rule {
+          source_labels = ["__syslog_message_facility"]
+          target_label  = "facility"
+        }
+        rule {
+          source_labels = ["__syslog_connection_hostname"]
+          target_label  = "connection_hostname"
+        }
+        forward_to = [loki.write.loki.receiver]
+      }
+
+      // -- Loki write endpoint (TLS) --
+      local.file "step_ca_root" {
+        filename = "/etc/alloy/ca/ca.crt"
+      }
+
+      loki.write "loki" {
+        endpoint {
+          url = "https://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push"
+          tls_config {
+            ca_pem = local.file.step_ca_root.content
+          }
+        }
+      }

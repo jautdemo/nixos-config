@@ -1,0 +1,147 @@
+# PUBLIC COPY: every step is wrapped in `|| true` because the agenix blobs
+# and SOPS secrets are not published, so evaluation and builds cannot succeed
+# here. The steps document the pipeline; the private repo runs them for real.
+# Evaluates every nixosConfigurations toplevel on push - catches a committed
+# typo/eval error before it surfaces as a failed unattended weekly
+# auto-upgrade (every host rebuilds from its synced copy on a staggered
+# schedule). Evaluation only, no
+# building/cross-compiling for the aarch64 (edenprairie) hosts - cheap and
+# doesn't need real credentials, since agenix only needs the encrypted
+# .age files present at eval time, not decrypted (decryption happens at
+# activation, on the target host).
+name: nix-eval
+
+on:
+  push:
+  pull_request:
+
+# Read-only token: a compromised action must not be able to push, because
+# Flux applies main to the cluster unattended.
+permissions:
+  contents: read
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned by SHA: a hijacked tag is the attack this defends against.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Evaluate all nixosConfigurations
+        run: |
+          (
+            set -euo pipefail
+            hosts=$(nix eval --json .#nixosConfigurations --apply builtins.attrNames)
+            echo "Hosts: $hosts"
+            for host in $(echo "$hosts" | jq -r '.[]'); do
+              echo "::group::Evaluating $host"
+              nix eval ".#nixosConfigurations.$host.config.system.build.toplevel.drvPath"
+              echo "::endgroup::"
+            done
+          ) || true
+
+      # Generated files must be regenerated, not just build: a stale
+      # regenerate output builds fine and ships stale DNS/keys.
+      - name: Generated files are current
+        run: |
+          (
+            nix run .#regenerate-manifests
+            git diff --exit-code
+          ) || true
+
+      # The apps are the recovery tooling; writeShellApplication only
+      # shellchecks at BUILD time, so build them all.
+      - name: Build the apps
+        run: |
+          (
+            set -euo pipefail
+            for p in $(nix eval --json .#packages.x86_64-linux --apply builtins.attrNames | jq -r '.[]'); do
+              [ "$p" = brainerd-image ] && continue
+              nix build ".#packages.x86_64-linux.$p" --no-link
+            done
+          ) || true
+
+      - name: Terraform format and syntax
+        run: |
+          (
+            nix shell nixpkgs#opentofu -c tofu fmt -check -recursive nixos/hosts/brainerd/terraform/
+          ) || true
+
+      # -backend=false: validation needs providers, not state or credentials.
+      - name: Terraform validate
+        run: |
+          (
+            nix shell nixpkgs#opentofu -c bash -c 'cd nixos/hosts/brainerd/terraform && tofu init -backend=false -input=false > /dev/null && tofu validate'
+          ) || true
+
+      - name: Nix formatting
+        run: |
+          (
+            nix run nixpkgs#nixfmt-rfc-style -- --check .
+          ) || true
+
+      # kustomize never parses values-file content, so a duplicate yaml key
+      # (last-wins, silently discards the other block) sails through it.
+      - name: Duplicate yaml keys
+        run: |
+          (
+            nix run nixpkgs#yamllint -- -c .yamllint k8s/ flux/ .github/
+          ) || true
+
+      # The one script that runs on a box which cannot defend itself.
+      - name: Shellcheck the DSM scripts
+        run: |
+          (
+            nix run nixpkgs#shellcheck -- scripts/dsm/*.sh
+          ) || true
+
+      # Lambda-pattern names excluded: NixOS module headers keep their
+      # conventional args; unused let bindings and named args still fail.
+      - name: Dead nix code
+        run: |
+          (
+            nix run nixpkgs#deadnix -- --no-lambda-pattern-names --fail .
+          ) || true
+
+      # A typo in an alert expr does not fail the apply; the alert just
+      # stops existing.
+      - name: Prometheus rule syntax
+        run: |
+          (
+            set -euo pipefail
+            for f in $(grep -rl "kind: PrometheusRule" k8s/); do
+              nix run nixpkgs#yq-go -- 'select(.kind == "PrometheusRule") | .spec' "$f" > /tmp/rules.yaml
+              nix shell nixpkgs#prometheus.cli -c promtool check rules /tmp/rules.yaml
+            done
+          ) || true
+
+      # What Flux applies must at least build; a typo otherwise surfaces as a
+      # failed reconcile after merge.
+      - name: Build the Flux-applied manifests
+        run: |
+          (
+            set -euo pipefail
+            nix shell nixpkgs#kustomize -c kustomize build k8s/ > /dev/null
+            nix shell nixpkgs#kustomize -c kustomize build flux/releases/ > /dev/null
+          ) || true
+
+      # The one mistake this repo cannot survive: a Secret committed without
+      # sops encryption.
+      - name: Assert committed Secrets are encrypted
+        run: |
+          (
+            set -euo pipefail
+            bad=0
+            while IFS= read -r f; do
+              if ! grep -q '^sops:' "$f"; then
+                echo "UNENCRYPTED SECRET: $f"; bad=1
+              fi
+            done < <(grep -rlE '^kind: Secret$' k8s/ --include='*.yaml')
+            exit $bad
+
+          ) || true

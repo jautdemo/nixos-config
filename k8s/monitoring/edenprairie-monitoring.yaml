@@ -1,0 +1,187 @@
+# Service-level alerting for edenprairie: DNS, Kerberos, LDAP and the internal
+# CA for the whole household, on one Pi with no redundancy. The stock TargetDown
+# needs the entire box to stop answering, so any one of those four could die
+# unnoticed while the Pi stayed up.
+#
+# Depends on the host's node-exporter systemd collector; without it
+# node_systemd_unit_state returns no series and every rule here is inert.
+# Check a new expression against live Prometheus before writing the rule.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: edenprairie
+  namespace: monitoring
+  labels:
+    app: kube-prometheus-stack
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: edenprairie-services
+      rules:
+        # The unit is up but not active. 2m waits out a restart (step-ca and
+        # lldap both get restarted by their cert-renewal units) without
+        # sitting on a real outage of household DNS or auth. Oneshot units are
+        # inactive between runs by design; their failures are caught below and
+        # by the staleness alerts.
+        - alert: EdenprairieServiceInactive
+          expr: node_systemd_unit_state{instance="edenprairie", state="active", type!="oneshot"} == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "edenprairie: {{ $labels.name }} is not active"
+            description: "systemctl status {{ $labels.name }}"
+
+        # Explicitly failed is worse than merely inactive, it will not come
+        # back by itself, so alert faster and do not wait out a restart.
+        - alert: EdenprairieServiceFailed
+          expr: node_systemd_unit_state{instance="edenprairie", state="failed"} == 1
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "edenprairie: {{ $labels.name }} has FAILED"
+            description: "Will not recover on its own. journalctl -u {{ $labels.name }} -n 50"
+
+        # Faster than the stock TargetDown (grouped by job, for: 10m). With
+        # only two targets in infra-node-exporter, TargetDown does eventually
+        # fire for this host, but 10 minutes of dead household DNS before the
+        # first alert is the wrong tradeoff for this particular box.
+        - alert: EdenprairieDown
+          expr: up{job="infra-node-exporter", instance="edenprairie"} == 0
+          for: 3m
+          labels:
+            severity: critical
+          annotations:
+            summary: "edenprairie is unreachable"
+            description: "If household DNS still answers, only node-exporter is down; otherwise the Pi is."
+
+        # Guards the monitoring itself. If the systemd collector is ever turned
+        # off, the unit-include allowlist stops matching after a rename, or the
+        # exporter is rebuilt without the flags, all the rules above silently
+        # stop evaluating, an alert that cannot fire looks exactly like an
+        # alert with nothing to report. 15m avoids flapping on a restart.
+        - alert: EdenprairieServiceMetricsMissing
+          expr: absent(node_systemd_unit_state{instance="edenprairie", state="active"})
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "edenprairie systemd unit metrics have disappeared"
+            description: "node_systemd_unit_state absent, so every per-service alert here is inert. Check the systemd collector's unit-include allowlist."
+
+        # A failed unit is not the only way offsite backup dies: a run killed
+        # at TimeoutStartSec leaves nothing failed behind, and the backup audit
+        # only checks the local snapshot tree. This watches the one thing that
+        # means the upload finished. 36h spans a single missed run.
+        - alert: OffsiteSyncStale
+          expr: >-
+            absent(offsite_sync_last_success_timestamp_seconds)
+            or time() - offsite_sync_last_success_timestamp_seconds > 129600
+          for: 30m
+          labels:
+            severity: critical
+          annotations:
+            summary: "edenprairie: no successful offsite sync in 36h"
+            description: "journalctl -u offsite-sync -n 50"
+
+    # Metrics come from protondrive-usage.service on edenprairie, via the
+    # node-exporter textfile collector.
+    #
+    # Thresholds are relative to the source size, not a fixed byte count:
+    # the restic offsite dedups, so day-to-day growth is small, but free
+    # space below one source-size means a from-scratch reseed no longer
+    # fits. A hardcoded byte limit rots; a ratio also survives a change of
+    # Proton plan.
+    - name: offsite-backup
+      rules:
+        - alert: ProtonDriveOffsiteLowHeadroom
+          expr: protondrive_free_bytes / backup_source_total_bytes < 2
+          for: 6h
+          labels:
+            severity: warning
+          annotations:
+            summary: "Proton Drive free space is under twice the backup source size"
+            description: "Prune restic retention or grow the plan before this reaches reseed-blocking levels."
+
+        - alert: ProtonDriveOffsiteReseedBlocked
+          expr: protondrive_free_bytes / backup_source_total_bytes < 1
+          for: 1h
+          labels:
+            severity: critical
+          annotations:
+            summary: "Proton Drive free space is below the backup source size"
+            description: "A from-scratch reseed of the restic repo no longer fits, and nightly growth is eating what is left. Free space now."
+
+        # The .prom file persists on disk, so a dead protondrive-usage leaves
+        # node-exporter serving the last values forever and the rules above
+        # evaluating frozen numbers. The timestamp is only written by a run
+        # that actually parsed rclone's output.
+        - alert: ProtonDriveUsageStale
+          expr: >-
+            absent(protondrive_usage_last_success_timestamp_seconds)
+            or (time() - protondrive_usage_last_success_timestamp_seconds) > 129600
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Proton Drive usage tracking has stopped updating"
+            description: "No protondrive-usage run in 36h, so the capacity alerts are reading stale values."
+
+    # These fire from edenprairie's wan-watchdog textfile metrics. Their job is
+    # DIAGNOSIS, not detection: during a real WAN outage Alertmanager cannot
+    # deliver anything anyway (email leaves via protonmail-bridge, which needs
+    # the WAN). Detection already works and comes from OUTSIDE, brainerd stops
+    # pinging healthchecks.io, which notifies from its own infrastructure.
+    # These rules exist so that when connectivity returns, the alert that lands
+    # already names the layer that broke, and the series behind it gives the
+    # exact window.
+    - name: wan-connectivity
+      rules:
+        # The one that matters: gateway answering while nothing off-net is
+        # reachable means the router is up but no longer forwarding. Distinct
+        # from an ISP outage, where the gateway usually still forwards and
+        # fails further out, and from the router being dead (below).
+        - alert: RouterForwardingBroken
+          expr: wan_watchdog_gateway_up == 1 and wan_watchdog_wan_up == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Router is up but not forwarding - power-cycle candidate"
+            description: "Gateway answers ICMP but 1.1.1.1 is unreachable by IP - not DNS. Check the router before assuming an ISP fault; this has needed a power cycle."
+
+        # Gateway itself silent: rebooted, crashed, or the link to it is gone.
+        - alert: GatewayUnreachable
+          expr: wan_watchdog_gateway_up == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Default gateway is not answering at all"
+            description: "Router not answering ICMP. Self-resolves if it is only a reboot."
+
+        # WAN fine but resolution dead, this is ours to fix, not the router's.
+        # dnsmasq dropping queries at dns-forward-max shows exactly this shape.
+        - alert: DNSBrokenWhileWANHealthy
+          expr: wan_watchdog_wan_up == 1 and wan_watchdog_dns_up == 0
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Name resolution is broken while the WAN is fine"
+            description: "1.1.1.1 reachable by IP but names do not resolve. Check dnsmasq and AdGuard."
+
+        # Same trap as ProtonDriveUsageStale: the .prom file persists, so a
+        # dead watchdog would leave all three rules above evaluating happily
+        # against frozen values, and silently blind for the next outage.
+        - alert: WANWatchdogStale
+          expr: >-
+            absent(wan_watchdog_last_run_timestamp_seconds)
+            or (time() - wan_watchdog_last_run_timestamp_seconds) > 600
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "WAN watchdog has stopped recording"
+            description: "No wan-watchdog run in 10m, so the connectivity alerts are reading stale values."

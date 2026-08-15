@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: diun-config
+  namespace: diun
+data:
+  diun.yml: |
+    watch:
+      # Sunday 12:00: clear of the 08:00-10:00 backup window, where bridge
+      # congestion times mail out.
+      schedule: "0 12 * * 0"
+      firstCheckNotif: false
+
+    notif:
+      mail:
+        host: edenprairie.infra.homelab.invalid
+        port: 11025
+        # ssl:false = STARTTLS. diun verifies the bridge's step-ca cert
+        # (SSL_CERT_FILE=/certs/root_ca.crt is mounted), so the hop is encrypted
+        # and verified. Accepted limitation: diun exposes no "require STARTTLS"
+        # knob, so this is opportunistic, a LAN attacker stripping STARTTLS
+        # could force plaintext. The bridge has no implicit-TLS port to make it
+        # mandatory. Enforcing it means switching tools (whatsupdocker) or an
+        # stunnel SMTPS shim; judged not worth it for a weekly image digest.
+        ssl: false
+        localName: diun.homelab.invalid
+        from: notifications@homelab.invalid
+        to:
+          - admin@homelab.invalid
+
+    providers:
+      kubernetes:
+        watchByDefault: true

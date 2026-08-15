@@ -1,0 +1,42 @@
+# Aggregate of every plain-manifest directory, plus the top-level policies.
+# This is what Flux's `apps` Kustomization points at (flux/clusters/home/).
+#
+# *values*.yaml is Helm input, not a manifest, and is excluded everywhere;
+# the Helm releases are declared separately.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - adguard
+  - authelia
+  - backup-audit
+  - cert-manager
+  - cilium
+  - cloudflared-web
+  - coredns
+  - db-backup
+  - diun
+  - external
+  - home-heartbeat
+  # Cluster-level health (is k8s WORKING), vs home-heartbeat's per-host
+  # liveness (is the box UP).
+  - cluster-healthcheck
+  # TEMPORARY, data-gathering for the egress NetworkPolicy work; delete after.
+  - egress-observer
+  - immich
+  - intel-gpu-plugin
+  - longhorn
+  - mariadb
+  - metrics-server
+  - monitoring
+  - mumble
+  - phpmyadmin
+  - plex
+  - redis
+  # Secret values shared across namespaces.
+  - secrets-backup
+  - wg-gateway
+  - whoami
+  # Top-level: the whole ingress security posture, including the two
+  # CiliumNetworkPolicies that make the apiserver/node paths actually work.
+  - network-policies.yaml
+  - image-admission-policy.yaml

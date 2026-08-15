@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mumble
+  namespace: mumble
+  annotations:
+    # BEGIN vip: nix run .#regenerate-manifests overwrites this block from cluster.json
+    lbipam.cilium.io/ips: "192.168.1.223"
+    # END vip
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Cluster
+  sessionAffinity: ClientIP
+  selector:
+    app: mumble
+  ports:
+    - name: mumble-tcp
+      port: 64738
+      targetPort: 64738
+      protocol: TCP
+    - name: mumble-udp
+      port: 64738
+      targetPort: 64738
+      protocol: UDP

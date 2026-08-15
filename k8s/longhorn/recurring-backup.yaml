@@ -1,0 +1,30 @@
+# RecurringJobSpec has no timeZone field, so "cron" below runs on the node's
+# clock (UTC). The healthchecks.io "daily-backup" check must be set
+# to the same zone by hand, or it cycles down/up against a healthy job.
+apiVersion: longhorn.io/v1beta2
+# Longhorn's controller generates and owns the daily-backup CronJob, so it is
+# the one CronJob here without ttlSecondsAfterFinished - the spec exposes no
+# ttl, and hand-edits get reverted.
+# Consequence: a failed daily-backup Job can linger and keep KubeJobFailed
+# firing. Acceptable because backup-audit verifies the artifacts independently
+# at 09:30 and is the authoritative signal for whether backups actually
+# happened; if a stale failed Job does show up, delete it by hand.
+kind: RecurringJob
+metadata:
+  name: daily-backup
+  namespace: longhorn-system
+spec:
+  # Staggered against mariadb-backup (08:20), immich-postgres-backup (08:30),
+  # redis-backup (08:35) and secrets-backup (08:50). Clustering them within a
+  # 15-minute span piles up enough backup I/O to spike etcd WAL fsync latency,
+  # which causes real etcd leader elections and step-issuer leader-election
+  # crashes. Spread across the whole 08:00-10:00 backup window instead of
+  # clustering at the start of it.
+  task: backup
+  cron: "5 8 * * *"
+  retain: 7
+  concurrency: 2
+  groups:
+    - default
+  labels:
+    schedule: daily

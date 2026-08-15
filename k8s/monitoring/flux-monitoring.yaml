@@ -1,0 +1,99 @@
+# Layer 2 of Flux alerting; layer 1 is Flux's own Alert/Provider.
+#
+# `gotk_reconcile_condition`, which most Flux alerting examples online use, does
+# not exist in Flux 2.8.8. The controllers expose only
+# gotk_reconcile_duration_seconds, gotk_token_cache_* and controller_runtime_*.
+# Check a metric against a live scrape before writing a rule on it.
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: flux-system
+  namespace: monitoring
+spec:
+  namespaceSelector:
+    matchNames: [flux-system]
+  selector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: [source-controller, kustomize-controller, helm-controller, notification-controller]
+  podMetricsEndpoints:
+    - port: http-prom
+      relabelings:
+        # Keep the pod name so an alert says which controller is unhealthy.
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: flux-system
+  namespace: monitoring
+spec:
+  groups:
+    - name: flux-system
+      rules:
+        # The dead-man's switch, and the reason this file exists. If the
+        # controllers stop or the PodMonitor breaks, the series vanish, and an
+        # error-based rule cannot fire on data that is not there.
+        - alert: FluxNotReporting
+          expr: absent(gotk_reconcile_duration_seconds_count)
+          for: 30m
+          labels:
+            severity: critical
+          annotations:
+            summary: Flux has stopped reporting metrics entirely
+            description: "No reconciliation metrics for 30m. The cluster is no longer known to be converging on git."
+
+        # Sustained reconcile errors in any controller. Rate over 10m so a
+        # single transient failure (a chart pull timing out, the Longhorn
+        # admission webhook restarting) does not page; `for: 15m` on top means
+        # it must genuinely persist.
+        - alert: FluxReconcileErrors
+          expr: |-
+            sum by (controller) (
+              rate(controller_runtime_reconcile_errors_total{namespace="flux-system"}[10m])
+            ) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Flux {{ $labels.controller }} has been erroring for 15m
+            description: "Sustained reconcile errors. flux get kustomizations; flux get helmreleases -A"
+
+        # Built on gotk_resource_info from kube-state-metrics
+        # custom-resource-state (configured in
+        # the kube-prometheus-stack values).
+        # The `suspended` label only exists when spec.suspend is set, so
+        # `suspended="false"` matches nothing, ever.
+        - alert: FluxResourceNotReady
+          expr: gotk_resource_info{ready="False"} == 1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Flux {{ $labels.customresource_kind }} {{ $labels.exported_namespace }}/{{ $labels.name }} is not Ready"
+            description: "Reconciliation failing for this object. The notification path carries the error text and usually arrives first."
+
+        # Ready=Unknown means "currently reconciling" and is normal for seconds
+        # at a time.
+        # Sustained for 30m it means genuinely broken, e.g. a chart download
+        # that never completes or a dependency that never becomes ready.
+        - alert: FluxResourceStuckReconciling
+          expr: gotk_resource_info{ready="Unknown"} == 1
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Flux {{ $labels.customresource_kind }} {{ $labels.exported_namespace }}/{{ $labels.name }} has been reconciling for 30m"
+            description: "Normal for seconds, not half an hour. Usually a stuck chart pull, a dead source, or a dependsOn that never goes ready."
+
+        - alert: FluxResourceSuspended
+          expr: gotk_resource_info{suspended="true"} == 1
+          for: 6h
+          labels:
+            severity: warning
+          annotations:
+            summary: "Flux {{ $labels.customresource_kind }} {{ $labels.exported_namespace }}/{{ $labels.name }} has been suspended for 6h"
+            description: "A suspended object silently stops tracking git, so the cluster drifts while looking healthy."

@@ -1,0 +1,25 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: loki-tls
+  namespace: monitoring
+spec:
+  secretName: loki-tls
+  issuerRef:
+    name: step-ca
+    kind: StepClusterIssuer
+    group: certmanager.step.sm
+  commonName: loki.monitoring.svc.cluster.local
+  duration: 8760h    # 1 year
+  renewBefore: 720h  # 30 days
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  dnsNames:
+    - loki.monitoring.svc.cluster.local
+    - loki.infra.homelab.invalid
+    - syslog.infra.homelab.invalid
+    - duluth.infra.homelab.invalid
+    - bemidji.infra.homelab.invalid
+    - fargo.infra.homelab.invalid
+

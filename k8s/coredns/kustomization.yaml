@@ -1,0 +1,12 @@
+# Plain manifests, not a HelmRelease: on a cold start Flux needs cluster DNS
+# to fetch its own sources, so DNS must come up from a bare `kubectl apply -k`.
+# A HelmRelease would deadlock behind the thing it deploys.
+# Registry image, not store-seeded: node-level DNS is edenprairie's dnsmasq,
+# so pulls work while cluster DNS is down.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - rbac.yaml
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml

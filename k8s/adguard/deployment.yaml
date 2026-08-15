@@ -1,0 +1,133 @@
+# DaemonSet, not Deployment. Cilium's L2 election picks a node without checking
+# it hosts a backend, so with externalTrafficPolicy: Local and one replica any
+# election landing elsewhere is a total household DNS outage. Cluster would
+# fix it too, but SNATs away the client IP the query log attributes by.
+#
+# State is ephemeral (emptyDir): a ReadWriteOnce PVC cannot mount on three
+# nodes. stats.db resets per restart and filter lists re-download.
+# The raw query log survives via querylog-tail below.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: adguard
+  namespace: adguard
+spec:
+  selector:
+    matchLabels:
+      app: adguard
+  template:
+    metadata:
+      labels:
+        app: adguard
+    spec:
+      initContainers:
+        # The committed config is AUTHORITATIVE, seeded on every pod start:
+        # changes made in the UI do not survive a restart. When bumping the
+        # image, port any schema_version migration back into the repo file.
+        - name: sync-config
+          image: busybox:1.38.0
+          command:
+            - sh
+            - -c
+            - |
+              echo "Seeding AdGuardHome.yaml from ConfigMap (repo is authoritative)"
+              # the admin password hash lives in a sops-encrypted secret, not in the seed config
+              sed "s|__ADMIN_HASH__|$(cat /admin/password-hash)|" \
+                /seed/AdGuardHome.yaml > /opt/adguardhome/conf/AdGuardHome.yaml
+              grep -q '__ADMIN_HASH__' /opt/adguardhome/conf/AdGuardHome.yaml \
+                && { echo "hash splice failed"; exit 1; } || true
+          volumeMounts:
+            - name: conf
+              mountPath: /opt/adguardhome/conf
+            - name: seed-config
+              mountPath: /seed
+            - name: admin
+              mountPath: /admin
+              readOnly: true
+      containers:
+        - name: adguard
+          image: adguard/adguardhome:v0.107.78
+          env:
+            - name: TZ
+              value: UTC
+          ports:
+            - name: dns-tcp
+              containerPort: 53
+              protocol: TCP
+            - name: dns-udp
+              containerPort: 53
+              protocol: UDP
+            - name: http
+              containerPort: 80
+              protocol: TCP
+            - name: https
+              containerPort: 443
+              protocol: TCP
+            - name: dot
+              containerPort: 853
+              protocol: TCP
+            - name: doq
+              containerPort: 853
+              protocol: UDP
+          volumeMounts:
+            - name: conf
+              mountPath: /opt/adguardhome/conf
+            - name: work
+              mountPath: /opt/adguardhome/work
+            - name: tls
+              mountPath: /certs
+              readOnly: true
+          # Sized for the filter refresh spike, not steady state: AdGuard parses
+          # all 29 blocklists while the old set is still resident, roughly
+          # doubling memory at peak. All replicas refresh on
+          # the same schedule, so a limit that clips the spike takes household
+          # DNS down everywhere at once, daily.
+          resources:
+            requests:
+              memory: 512Mi
+              cpu: 100m
+            limits:
+              memory: 2Gi
+        # AdGuard can only write its query log to a file, never stdout, so this
+        # tails it to stdout where alloy picks it up. Query with {namespace="adguard", container="querylog-tail"}
+        # `tail -F` retries a missing file and follows rotation by name.
+        - name: querylog-tail
+          image: busybox:1.38.0
+          command:
+            - tail
+            - -F
+            - /opt/adguardhome/work/data/querylog.json
+          volumeMounts:
+            - name: work
+              mountPath: /opt/adguardhome/work
+              readOnly: true
+          resources:
+            requests:
+              memory: 16Mi
+              cpu: 10m
+            limits:
+              memory: 64Mi
+      volumes:
+        # emptyDir is unbounded by default and would grow into the NODE's disk.
+        # Exceeding the limit evicts the pod, which the DaemonSet survives, but
+        # keep querylog.interval in the committed config well under it.
+        - name: conf
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: work
+          emptyDir:
+            sizeLimit: 2Gi
+        - name: tls
+          secret:
+            secretName: adguard-tls
+            items:
+              - key: tls.crt
+                path: fullchain.pem
+              - key: tls.key
+                path: privkey.pem
+        - name: seed-config
+          configMap:
+            name: adguard-seed-config
+        - name: admin
+          secret:
+            secretName: adguard-admin

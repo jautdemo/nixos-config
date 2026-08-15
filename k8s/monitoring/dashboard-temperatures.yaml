@@ -1,0 +1,154 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-temperatures
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  temperatures.json: |
+    {
+      "annotations": { "list": [] },
+      "editable": true,
+      "graphTooltip": 1,
+      "links": [],
+      "panels": [
+        {
+          "title": "CPU Temperature",
+          "type": "timeseries",
+          "gridPos": { "h": 10, "w": 24, "x": 0, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineInterpolation": "smooth", "lineWidth": 2, "showPoints": "never", "spanNulls": false, "thresholdsStyle": { "mode": "dashed" } },
+              "unit": "celsius",
+              "min": 20,
+              "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 65 }, { "color": "red", "value": 80 } ] }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "right" },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "datasource": { "type": "prometheus", "uid": "$datasource" }, "expr": "node_hwmon_temp_celsius{chip=\"platform_coretemp_0\", sensor=\"temp1\"}", "legendFormat": "{{instance}}", "refId": "A" },
+            { "datasource": { "type": "prometheus", "uid": "$datasource" }, "expr": "node_hwmon_temp_celsius{instance=\"edenprairie\", chip=\"thermal_thermal_zone0\", sensor=\"temp1\"}", "legendFormat": "edenprairie", "refId": "B" }
+          ]
+        },
+        {
+          "title": "NVMe Temperature",
+          "type": "timeseries",
+          "gridPos": { "h": 10, "w": 12, "x": 0, "y": 10 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineInterpolation": "smooth", "lineWidth": 2, "showPoints": "never", "spanNulls": false, "thresholdsStyle": { "mode": "dashed" } },
+              "unit": "celsius",
+              "min": 20,
+              "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 55 }, { "color": "red", "value": 70 } ] }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "right" },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "datasource": { "type": "prometheus", "uid": "$datasource" }, "expr": "node_hwmon_temp_celsius{chip=\"nvme_nvme0\", sensor=\"temp1\"}", "legendFormat": "{{instance}}", "refId": "A" }
+          ]
+        },
+        {
+          "title": "Board / Chassis Temperature",
+          "type": "timeseries",
+          "gridPos": { "h": 10, "w": 12, "x": 12, "y": 10 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineInterpolation": "smooth", "lineWidth": 2, "showPoints": "never", "spanNulls": false, "thresholdsStyle": { "mode": "dashed" } },
+              "unit": "celsius",
+              "min": 20,
+              "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 55 }, { "color": "red", "value": 70 } ] }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "right" },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "datasource": { "type": "prometheus", "uid": "$datasource" }, "expr": "node_hwmon_temp_celsius{chip=\"i2c_0_0_0050\", sensor=\"temp1\"}", "legendFormat": "{{instance}} board", "refId": "A" },
+            { "datasource": { "type": "prometheus", "uid": "$datasource" }, "expr": "node_hwmon_temp_celsius{chip=~\"thermal_thermal_zone.*\", sensor=\"temp0\"}", "legendFormat": "{{instance}} thermal", "refId": "B" },
+            { "datasource": { "type": "prometheus", "uid": "$datasource" }, "expr": "node_hwmon_temp_celsius{instance=\"edenprairie\", chip=\"1000120000_pcie_1f000c8000_adc\", sensor=\"temp1\"}", "legendFormat": "edenprairie ADC", "refId": "C" }
+          ]
+        },
+        {
+          "title": "NAS Disk Temperatures",
+          "type": "timeseries",
+          "gridPos": { "h": 10, "w": 24, "x": 0, "y": 20 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineInterpolation": "smooth", "lineWidth": 2, "showPoints": "never", "spanNulls": false, "thresholdsStyle": { "mode": "dashed" } },
+              "unit": "celsius",
+              "min": 20,
+              "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 45 }, { "color": "red", "value": 55 } ] }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "right" },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "datasource": { "type": "prometheus", "uid": "$datasource" }, "expr": "node_hwmon_temp_celsius{instance=\"nas\", chip!~\".*coretemp.*|.*thermal.*\"}", "legendFormat": "{{chip}} {{sensor}}", "refId": "A" }
+          ]
+        },
+        {
+          "title": "Current Temperatures",
+          "type": "gauge",
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 30 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "thresholds" },
+              "unit": "celsius",
+              "min": 20,
+              "max": 100,
+              "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 65 }, { "color": "orange", "value": 75 }, { "color": "red", "value": 85 } ] }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "showThresholdLabels": false,
+            "showThresholdMarkers": true
+          },
+          "targets": [
+            { "datasource": { "type": "prometheus", "uid": "$datasource" }, "expr": "node_hwmon_temp_celsius{chip=\"platform_coretemp_0\", sensor=\"temp1\"}", "legendFormat": "{{instance}}", "refId": "A" },
+            { "datasource": { "type": "prometheus", "uid": "$datasource" }, "expr": "node_hwmon_temp_celsius{instance=\"edenprairie\", chip=\"thermal_thermal_zone0\", sensor=\"temp1\"}", "legendFormat": "edenprairie", "refId": "B" }
+          ]
+        }
+      ],
+      "schemaVersion": 39,
+      "tags": ["temperature", "hardware"],
+      "templating": {
+        "list": [
+          {
+            "name": "datasource",
+            "query": "prometheus",
+            "type": "datasource",
+            "current": { "selected": true, "text": "Prometheus", "value": "prometheus" }
+          }
+        ]
+      },
+      "time": { "from": "now-6h", "to": "now" },
+      "timezone": "UTC",
+      "title": "Infrastructure Temperatures",
+      "uid": "infra-temperatures",
+      "version": 1
+    }

@@ -1,0 +1,133 @@
+# Two things kube-prometheus-stack scrapes but does not alert on:
+# 1. etcd (job="kube-etcd"), the built-in etcd rules are not enabled, so lost
+#    quorum and election-triggering disk latency pass silently.
+# 2. The stock NodeFilesystem* rules select job="node-exporter", which is only
+#    the k8s nodes; the NAS and edenprairie are job="infra-node-exporter".
+# Thresholds are ~10x observed values. /volume1 is excluded: 30TB of
+# bulk media that lives near-full by design.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: etcd-and-infra
+  namespace: monitoring
+  labels:
+    app: kube-prometheus-stack
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: etcd
+      rules:
+        - alert: EtcdNoLeader
+          expr: etcd_server_has_leader == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "etcd member {{ $labels.instance }} has no leader"
+            description: "etcd cannot serve writes; the apiserver is read-only and nothing can change."
+
+        # Catches a member being gone even while the remaining two hold quorum
+        # and everything looks fine - nothing else alerts on that state.
+        - alert: EtcdMemberDown
+          expr: count(etcd_server_has_leader) < 3
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "etcd is down to {{ $value }} of 3 members"
+            description: "Quorum survives one member down, not two. Urgent even though the cluster still works."
+
+        # The alert that replaces checking by hand after each backup window.
+        - alert: EtcdFrequentLeaderChanges
+          expr: increase(etcd_server_leader_changes_seen_total[15m]) > 3
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "etcd leader changed {{ $value | printf \"%.0f\" }} times in 15m"
+            description: "Usually disk or network latency, not a crash. Check the fsync alert and what else was scheduled at the same time."
+
+        - alert: EtcdHighFsyncLatency
+          expr: |
+            histogram_quantile(0.99, sum by (instance, le) (rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m]))) > 0.1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "etcd WAL fsync p99 is {{ $value | humanizeDuration }} on {{ $labels.instance }}"
+            description: "Normal is 8-11ms. Sustained >100ms precedes leader elections, usually from disk contention."
+
+        - alert: EtcdHighCommitLatency
+          expr: |
+            histogram_quantile(0.99, sum by (instance, le) (rate(etcd_disk_backend_commit_duration_seconds_bucket[5m]))) > 0.25
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "etcd backend commit p99 is {{ $value | humanizeDuration }} on {{ $labels.instance }}"
+            description: "Normal is 8-15ms. Sustained high commit latency degrades every write."
+
+    - name: infra-filesystems
+      rules:
+        # Two exclusions:
+        #   nfs        edenprairie mounts the NAS, so counting it would alert
+        #              twice for one physical disk.
+        #   /volume1*  bulk media, near-full by design. The glob also
+        #              covers its btrfs subvolumes, whose free-space projections
+        #              contradict each other.
+        - alert: InfraFilesystemPredictedFull
+          expr: |
+            predict_linear(node_filesystem_avail_bytes{job="infra-node-exporter", fstype!~"tmpfs|ramfs|overlay|squashfs|iso9660|nfs4|nfs", mountpoint!~"/volume1.*"}[7d], 30*24*3600) < 0
+          for: 6h
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.instance }}:{{ $labels.mountpoint }} is projected to fill within 30 days"
+            description: "Projected from 7 days of growth. /volume1 is excluded as bulk media."
+
+        - alert: InfraFilesystemLowSpace
+          expr: |
+            100 * node_filesystem_avail_bytes{job="infra-node-exporter", fstype!~"tmpfs|ramfs|overlay|squashfs|iso9660|nfs4|nfs", mountpoint!~"/volume1.*"}
+              / node_filesystem_size_bytes{job="infra-node-exporter", fstype!~"tmpfs|ramfs|overlay|squashfs|iso9660|nfs4|nfs", mountpoint!~"/volume1.*"} < 5
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.instance }}:{{ $labels.mountpoint }} is {{ $value | printf \"%.1f\" }}% free"
+            description: "Not bulk media - this mount running out breaks something."
+
+        - alert: InfraFilesystemCriticalSpace
+          expr: |
+            100 * node_filesystem_avail_bytes{job="infra-node-exporter", fstype!~"tmpfs|ramfs|overlay|squashfs|iso9660|nfs4|nfs", mountpoint!~"/volume1.*"}
+              / node_filesystem_size_bytes{job="infra-node-exporter", fstype!~"tmpfs|ramfs|overlay|squashfs|iso9660|nfs4|nfs", mountpoint!~"/volume1.*"} < 2
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: "{{ $labels.instance }}:{{ $labels.mountpoint }} is {{ $value | printf \"%.1f\" }}% free"
+            description: "On the NAS this stops backups; on edenprairie it stops step-ca, lldap and dnsmasq writing."
+
+    # nixos_deployed_rev is published by the deployed-rev-metrics timer on
+    # edenprairie and the k8s nodes; brainerd is not scraped by Prometheus,
+    # so its rev is out of scope here.
+    - name: fleet-deploy
+      rules:
+        # 2h absorbs a slow sequential `deploy --all` (edenprairie builds can
+        # take a while) without alerting mid-deploy.
+        - alert: FleetRevisionDrift
+          expr: count(count by (rev) (nixos_deployed_rev{rev!="unknown"})) > 1
+          for: 2h
+          labels:
+            severity: warning
+          annotations:
+            summary: "Hosts are running {{ $value }} different config revisions"
+            description: "A deploy covered only part of the fleet. Finish it: nix run .#deploy -- --all"
+
+        - alert: FleetRevisionUnknown
+          expr: nixos_deployed_rev{rev="unknown"} == 1
+          for: 6h
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.instance }} has no readable .deployed-rev"
+            description: "The host cannot say what config it runs; a deploy from the repo rewrites the file."

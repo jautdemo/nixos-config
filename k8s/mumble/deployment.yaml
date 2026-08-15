@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mumble
+  namespace: mumble
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: mumble
+  template:
+    metadata:
+      labels:
+        app: mumble
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: mumble
+          image: mumblevoip/mumble-server:v1.6.870-3
+          ports:
+            - containerPort: 64738
+              protocol: TCP
+            - containerPort: 64738
+              protocol: UDP
+          env:
+            - name: MUMBLE_VERBOSE
+              value: "true"
+            - name: MUMBLE_CONFIG_OPUSTHRESHOLD
+              value: "0"
+            - name: MUMBLE_CONFIG_MESSAGEBURST
+              value: "5"
+            - name: MUMBLE_CONFIG_MESSAGELIMIT
+              value: "10"
+            - name: MUMBLE_CONFIG_USERS
+              value: "20"
+            - name: MUMBLE_CONFIG_BANDWIDTH
+              value: "512000"
+            - name: MUMBLE_CONFIG_SSL_CERT
+              value: /certs/tls.crt
+            - name: MUMBLE_CONFIG_SSL_KEY
+              value: /certs/tls.key
+            - name: MUMBLE_CONFIG_WELCOMETEXT
+              value: "Erstmal Aram spielen"
+            - name: MUMBLE_CONFIG_DEFAULTCHANNEL
+              value: "0"
+            - name: MUMBLE_CONFIG_REMEMBERCHANNEL
+              value: "true"
+            - name: MUMBLE_CONFIG_ALLOWHTML
+              value: "true"
+            - name: MUMBLE_CONFIG_LOGDAYS
+              value: "36500"
+            - name: MUMBLE_CONFIG_TIMEOUT
+              value: "30"
+            - name: MUMBLE_CONFIG_ALLOWPING
+              value: "true"
+            - name: MUMBLE_CONFIG_SENDVERSION
+              value: "true"
+            - name: MUMBLE_CONFIG_CHANNELNESTINGLIMIT
+              value: "10"
+            - name: MUMBLE_CONFIG_IMAGEMESSAGELENGTH
+              value: "104857600"
+            - name: MUMBLE_CONFIG_ALLOWRECORDING
+              value: "false"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tls
+              mountPath: /certs
+              readOnly: true
+            - name: secrets
+              mountPath: /run/secrets
+              readOnly: true
+          resources:
+            requests:
+              memory: 64Mi
+              cpu: 50m
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: mumble-data
+        - name: tls
+          secret:
+            secretName: mumble-tls
+        - name: secrets
+          secret:
+            secretName: mumble-passwords

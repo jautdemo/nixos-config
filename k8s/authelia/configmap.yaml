@@ -1,0 +1,133 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: authelia-config
+  namespace: authelia
+data:
+  configuration.yml: |
+    theme: dark
+    certificates_directory: /certs/
+    server:
+      address: tcp://0.0.0.0:9091/
+    log:
+      level: info
+    totp:
+      disable: false
+      issuer: authelia.com
+      algorithm: sha1
+      digits: 6
+      period: 30
+      skew: 1
+      disable_reuse_security_policy: true
+    ntp:
+      address: "time.cloudflare.com:123"
+      version: 4
+      max_desync: '3s'
+      disable_startup_check: false
+      disable_failure: false
+    authentication_backend:
+      password_reset:
+        disable: false
+      refresh_interval: 1m
+      ldap:
+        implementation: custom
+        address: ldaps://ldap.homelab.invalid:6360
+        timeout: 5s
+        start_tls: false
+        tls:
+          skip_verify: false
+        base_dn: dc=homelab,dc=invalid
+        additional_users_dn: ou=people
+        users_filter: "(&({username_attribute}={input})(objectClass=person))"
+        additional_groups_dn: ou=groups
+        groups_filter: "(member={dn})"
+        attributes:
+          display_name: displayName
+          username: uid
+          group_name: cn
+          mail: mail
+        user: uid=authelia-bind,ou=people,dc=homelab,dc=invalid
+    access_control:
+      default_policy: deny
+      rules:
+        - domain: authelia.homelab.invalid
+          policy: bypass
+        - domain: whoami.homelab.invalid
+          policy: two_factor
+          subject: ["group:all_users", "group:server_admins"]
+        # Catch-all
+        - domain: "*.homelab.invalid"
+          policy: two_factor
+          subject: ["group:server_admins"]
+    session:
+      name: authelia_session
+      same_site: 'lax'
+      inactivity: '8 hours'
+      expiration: '12 hours'
+      remember_me: '1 month'
+      cookies:
+        - domain: 'homelab.invalid'
+          authelia_url: 'https://authelia.homelab.invalid'
+          default_redirection_url: 'https://whoami.homelab.invalid'
+          name: 'authelia_session'
+          same_site: 'lax'
+          inactivity: '8 hours'
+          expiration: '12 hours'
+          remember_me: '1 month'
+      redis:
+        host: redis.redis.svc
+        port: 6379
+    regulation:
+      max_retries: 5
+      find_time: 300
+      ban_time: 600
+    storage:
+      mysql:
+        address: tcp://mariadb.mariadb.svc:3306
+        database: authelia
+        username: autheliaDbUser
+    identity_providers:
+      oidc:
+        # hmac_secret comes via AUTHELIA_IDENTITY_PROVIDERS_OIDC_HMAC_SECRET
+        # (env var, authelia-secrets Secret) - a plain scalar, so the normal
+        # env-var-override mechanism works for it like every other secret here.
+        #
+        # jwks[].key and clients[].client_secret CANNOT be set via env var or
+        # secret file - Authelia explicitly doesn't support that for list
+        # entries. Using Authelia's config templating (fileContent) instead,
+        # reading from files mounted out of the (not-git-committed)
+        # authelia-secrets Secret, so no key/secret material sits in this
+        # ConfigMap in git.
+        jwks:
+          - key_id: "immich-2026"
+            algorithm: RS256
+            use: sig
+            key: |
+              {{ fileContent "/secrets-oidc/oidc-jwk-private-key.pem" | nindent 14 }}
+        clients:
+          - client_id: immich
+            client_name: Immich
+            client_secret: '{{ fileContent "/secrets-oidc/oidc-immich-client-secret" }}'
+            public: false
+            require_pkce: false
+            authorization_policy: two_factor
+            redirect_uris:
+              - https://photos.homelab.invalid/auth/login
+              - https://photos.homelab.invalid/user-settings
+              - app.immich:///oauth-callback
+            scopes: [openid, profile, email]
+            grant_types: [authorization_code]
+            response_types: [code]
+            token_endpoint_auth_method: client_secret_post
+            access_token_signed_response_alg: none
+            userinfo_signed_response_alg: none
+    notifier:
+      smtp:
+        username: admin@homelab.invalid
+        address: smtp://edenprairie.infra.homelab.invalid:11025
+        timeout: 30s
+        sender: authelia@homelab.invalid
+        subject: "[Authelia] {title}"
+        startup_check_address: admin@homelab.invalid
+        tls:
+          skip_verify: false

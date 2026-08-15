@@ -1,0 +1,22 @@
+# Syslog receiver, routes NAS TLS syslog to the Alloy DaemonSet.
+# IP from cluster.json, loadBalancer.vips.syslog.
+apiVersion: v1
+kind: Service
+metadata:
+  name: alloy-syslog
+  namespace: monitoring
+  annotations:
+    # BEGIN vip: nix run .#regenerate-manifests overwrites this block from cluster.json
+    lbipam.cilium.io/ips: "192.168.1.225"
+    # END vip
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/instance: alloy
+    app.kubernetes.io/name: alloy
+  ports:
+    - name: tcp-syslog
+      port: 1514
+      targetPort: 1514
+      protocol: TCP

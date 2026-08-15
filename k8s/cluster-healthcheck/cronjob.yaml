@@ -1,0 +1,422 @@
+# Asks whether Kubernetes is WORKING, from inside the cluster against real
+# objects. A node can be Ready with everything Running and unable to attach a
+# volume. Failures ping /fail with the details in the body; no mail of its own,
+# so there is one alert path. Check set to "every 5 minutes", ~12 min grace.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cluster-healthcheck
+  namespace: monitoring
+---
+# ClusterRole, not Role: nodes and Longhorn CRs are cluster-scoped or live in
+# other namespaces. Read-only throughout, this check never mutates anything,
+# unlike plex-healthcheck which self-heals prefs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cluster-healthcheck
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods", "services"]
+    verbs: ["get", "list"]
+  # check 13 reads cilium's pod CIDR pool, nothing else
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["cilium-config"]
+    verbs: ["get"]
+  # Both for check 8b: the L2 lease says which node is announcing a VIP, the
+  # EndpointSlice says which nodes can actually serve it.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list"]
+  - apiGroups: ["longhorn.io"]
+    resources: ["volumes", "nodes", "settings", "engineimages"]
+    verbs: ["get", "list"]
+  - apiGroups: ["kustomize.toolkit.fluxcd.io"]
+    resources: ["kustomizations"]
+    verbs: ["get", "list"]
+  - apiGroups: ["helm.toolkit.fluxcd.io"]
+    resources: ["helmreleases"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["daemonsets", "deployments", "statefulsets"]
+    verbs: ["get", "list"]
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    verbs: ["get", "list"]
+  # /readyz is a non-resource URL, the apiserver's own aggregate readiness,
+  # which is what reports etcd health (`[-]etcd failed` is what surfaces a
+  # missing member).
+  - nonResourceURLs: ["/readyz"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cluster-healthcheck
+subjects:
+  - kind: ServiceAccount
+    name: cluster-healthcheck
+    namespace: monitoring
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-healthcheck
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cluster-healthcheck
+  namespace: monitoring
+spec:
+  schedule: "*/5 * * * *"
+  timeZone: "UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Without this, one transient failure keeps KubeJobFailed firing until a
+      # new failure rotates it out.
+      ttlSecondsAfterFinished: 3600
+      backoffLimit: 0
+      template:
+        spec:
+          serviceAccountName: cluster-healthcheck
+          restartPolicy: Never
+          # The edenprairie fallback is what makes check 6 reportable: under
+          # ClusterFirst this job could detect that cluster DNS is down and be
+          # unable to resolve hc-ping.com to say so.
+          # CAVEAT: musl queries both nameservers and takes the first answer,
+          # and edenprairie NXDOMAINs cluster.local - resolve internal names
+          # with an EXPLICIT server, never through this resolver.
+          dnsPolicy: None
+          dnsConfig:
+            nameservers:
+              # BEGIN nameservers: nix run .#regenerate-manifests overwrites this block from cluster.json
+              - 10.0.0.254 # kube-dns Service (CoreDNS)
+              - 192.168.1.193 # edenprairie dnsmasq - out-of-band fallback
+              # END nameservers
+            searches:
+              - svc.cluster.local
+              - cluster.local
+            options:
+              - name: ndots
+                value: "1"
+              - name: timeout
+                value: "2"
+              - name: attempts
+                value: "1"
+          # This job writes nothing, so pin it to nobody rather than
+          # inheriting whatever UID the base image runs as.
+          securityContext:
+            runAsUser: 65534
+            runAsGroup: 65534
+            runAsNonRoot: true
+          containers:
+            - name: check
+              image: alpine/k8s:1.36.2
+              env:
+                - name: HC_PING_KEY
+                  valueFrom:
+                    secretKeyRef: { name: healthchecks-ping, key: ping-key }
+                # AdGuard's LoadBalancer VIP, the address every device in the
+                # house actually resolves through.
+                - name: ADGUARD_VIP
+                  # BEGIN adguardvip: nix run .#regenerate-manifests overwrites this block from cluster.json
+                  value: "192.168.1.221"
+                  # END adguardvip
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -u
+                  # ?create=1 is REQUIRED: a slug ping to a check that does not exist
+                  # returns 404 and is discarded, and the ping is `|| true`, so the job
+                  # still looks successful - a dead-man's switch monitoring nothing.
+                  hc_ping() {
+                    if [ "$FAILED" -eq 0 ]; then
+                      curl -fsS -m10 --retry 5 --retry-delay 2 --retry-all-errors --retry-max-time 45 -o /dev/null --data-raw "$DETAILS" "https://hc-ping.com/${HC_PING_KEY}/cluster-healthcheck?create=1" || echo "WARNING: success ping to healthchecks.io FAILED after retries" >&2
+                    else
+                      curl -fsS -m10 --retry 5 --retry-delay 2 --retry-all-errors --retry-max-time 45 -o /dev/null --data-raw "$DETAILS" "https://hc-ping.com/${HC_PING_KEY}/cluster-healthcheck/fail?create=1" || echo "WARNING: failure ping to healthchecks.io FAILED after retries" >&2
+                    fi
+                  }
+                  trap hc_ping EXIT
+                  FAILED=0
+                  DETAILS=""
+                  # A real newline. In --data-raw a double-quoted "\n" is a literal
+                  # backslash-n, so the mail arrives as one long line while the pod
+                  # logs look right. $() eats trailing newlines, hence the sentinel.
+                  NL=$(printf '\nx'); NL=${NL%x}
+                  fail() { FAILED=$((FAILED + 1)); DETAILS="${DETAILS}  FAIL $1${NL}"; }
+                  ok()   { DETAILS="${DETAILS}  OK   $1${NL}"; }
+                  info() { DETAILS="${DETAILS}  INFO $1${NL}"; }
+
+                  # 1. Nodes Ready AND schedulable. A node left cordoned by a
+                  # half-finished drain silently removes a third of capacity.
+                  NOT_READY=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}={.status.conditions[?(@.type=="Ready")].status} {end}' 2>/dev/null | tr ' ' '\n' | grep -v '=True$' | grep -v '^$' | tr '\n' ' ')
+                  if [ -n "$NOT_READY" ]; then fail "nodes not Ready: ${NOT_READY}"; else ok "all nodes Ready"; fi
+                  # A cordoned node is not automatically a fault - deploys, autoUpgrade and
+                  # kured all cordon routinely, and paging on those trains you to ignore
+                  # the alert. Two self-limiting signals mean "planned": kured's node lock
+                  # and the drain-started stamp, honoured for 30 MINUTES only.
+                  KURED_LOCK=$(kubectl -n kube-system get ds kured -o jsonpath='{.metadata.annotations}' 2>/dev/null || true)
+                  NOW_S=$(date +%s)
+                  CORDONED=$(kubectl get nodes -o jsonpath='{range .items[?(@.spec.unschedulable==true)]}{.metadata.name} {end}' 2>/dev/null)
+                  STUCK=""; PLANNED=""
+                  for n in $CORDONED; do
+                    # The lock value is a JSON string, so its inner quotes
+                    # arrive escaped. Strip backslashes before matching.
+                    if printf '%s' "$KURED_LOCK" | tr -d '\\' | grep -q "\"nodeID\":\"$n\""; then
+                      PLANNED="$PLANNED ${n}(kured-reboot)"; continue
+                    fi
+                    ann=$(kubectl get node "$n" -o jsonpath='{.metadata.annotations}' 2>/dev/null || true)
+                    started=$(printf '%s' "$ann" | grep -oE '"maintenance\.homelab\.io/drain-started":"[0-9]+"' | grep -oE '[0-9]+' | tail -1)
+                    if [ -n "${started:-}" ] && [ "$(( NOW_S - started ))" -lt 1800 ]; then
+                      PLANNED="$PLANNED ${n}(draining $(( NOW_S - started ))s)"; continue
+                    fi
+                    STUCK="$STUCK $n"
+                  done
+                  if [ -n "$STUCK" ]; then fail "nodes cordoned with no maintenance in progress:${STUCK}"; fi
+                  [ -n "$PLANNED" ] && info "nodes cordoned for planned maintenance (not paging):${PLANNED}"
+                  [ -z "$STUCK" ] && [ -z "$PLANNED" ] && ok "no nodes cordoned"
+
+                  # 2. apiserver aggregate readiness, this is what surfaces a
+                  # missing etcd member (`[-]etcd failed`).
+                  RZ=$(kubectl get --raw /readyz 2>&1)
+                  if [ "$RZ" = "ok" ]; then
+                    ok "apiserver /readyz ok (etcd quorum healthy)"
+                  else
+                    BADC=$(printf '%s' "$RZ" | grep -oE '\[-\][a-z-]+' | tr '\n' ' ')
+                    [ -z "$BADC" ] && BADC=$(printf '%.120s' "$RZ")
+                    fail "apiserver /readyz failing: ${BADC}"
+                  fi
+
+                  # 3. Longhorn volumes. Faulted pages; degraded is info, since every
+                  # normal replica rebuild passes through it. attaching/detaching must not
+                  # page on sight - a transition is only a problem if it does not
+                  # COMPLETE, so re-sample before judging.
+                  read_vols() {
+                    kubectl -n longhorn-system get volumes.longhorn.io -o jsonpath='{range .items[*]}{.metadata.name}|{.status.state}|{.status.robustness}{"\n"}{end}' 2>/dev/null
+                  }
+                  in_transit() { printf '%s\n' "$1" | awk -F'|' '$2!="attached" && $2!="detached" && $2!=""{printf "%s(%s) ", $1, $2}'; }
+
+                  VOLS=$(read_vols)
+                  if [ -z "$VOLS" ]; then
+                    fail "could not list Longhorn volumes at all"
+                  else
+                    TOTAL=$(printf '%s\n' "$VOLS" | grep -c '|')
+                    FAULTED=$(printf '%s\n' "$VOLS" | awk -F'|' '$3=="faulted"{printf "%s ", $1}')
+                    DEGRADED=$(printf '%s\n' "$VOLS" | awk -F'|' '$3=="degraded"{printf "%s ", $1}')
+                    MOVING=$(in_transit "$VOLS")
+                    if [ -n "$MOVING" ]; then
+                      sleep 45
+                      VOLS2=$(read_vols)
+                      STILL=$(in_transit "$VOLS2")
+                      # Re-read faulted too: a failed attach lands there.
+                      FAULTED=$(printf '%s\n' "$VOLS2" | awk -F'|' '$3=="faulted"{printf "%s ", $1}')
+                      if [ -n "$STILL" ]; then
+                        fail "Longhorn volumes STILL mid-transition after 45s: ${STILL}"
+                      else
+                        info "volumes were mid-transition and settled normally: ${MOVING}"
+                      fi
+                    fi
+                    [ -n "$FAULTED" ] && fail "Longhorn volumes FAULTED: ${FAULTED}"
+                    [ -n "$DEGRADED" ] && info "Longhorn volumes degraded (rebuilding, not paging): ${DEGRADED}"
+                    [ -z "$FAULTED" ] && [ -z "$MOVING" ] && ok "Longhorn: ${TOTAL} volumes, none faulted or stuck"
+                  fi
+
+                  # 4. Longhorn's own view of its nodes: a node can be k8s-Ready while
+                  # Longhorn considers it unusable. Cordoning is skipped here because
+                  # check 1 already judged it, and reporting it twice doubles every
+                  # maintenance page.
+                  LHN=$(kubectl -n longhorn-system get nodes.longhorn.io -o jsonpath='{range .items[*]}{.metadata.name}|{.status.conditions[?(@.type=="Ready")].status}|{.status.conditions[?(@.type=="Schedulable")].status}|{.status.conditions[?(@.type=="Schedulable")].reason}{"\n"}{end}' 2>/dev/null)
+                  BADLHN=$(printf '%s\n' "$LHN" | awk -F'|' '$1!="" && ($2!="True" || ($3!="True" && $4!="KubernetesNodeCordoned")){printf "%s(ready=%s,sched=%s,reason=%s) ", $1, $2, $3, $4}')
+                  CORDLHN=$(printf '%s\n' "$LHN" | awk -F'|' '$1!="" && $2=="True" && $3!="True" && $4=="KubernetesNodeCordoned"{printf "%s ", $1}')
+                  if [ -n "$BADLHN" ]; then fail "Longhorn nodes unhealthy: ${BADLHN}"; else ok "Longhorn nodes all Ready (none unschedulable for a non-cordon reason)"; fi
+                  [ -n "$CORDLHN" ] && info "Longhorn unschedulable due to cordon (see the cordon check above): ${CORDLHN}"
+
+                  # 5. Engine image drift. A chart upgrade moves the manager and CSI
+                  # sidecars but not the per-volume engines - the actual data path -
+                  # unless concurrentAutomaticEngineUpgradePerNodeLimit > 0.
+                  DEF=$(kubectl -n longhorn-system get settings.longhorn.io default-engine-image -o jsonpath='{.value}' 2>/dev/null)
+                  if [ -n "$DEF" ]; then
+                    STALE=$(kubectl -n longhorn-system get engineimages.longhorn.io -o jsonpath='{range .items[*]}{.spec.image}|{.status.refCount}{"\n"}{end}' 2>/dev/null | awk -F'|' -v d="$DEF" '$1!=d && $2>0{printf "%s(%s refs) ", $1, $2}')
+                    if [ -n "$STALE" ]; then info "engine image drift - volumes still on a non-default engine: ${STALE}(default ${DEF})"; else ok "all volume engines on the default image"; fi
+                  else
+                    info "could not read default-engine-image"
+                  fi
+
+                  # 6. Cluster DNS, queried DIRECTLY at the kube-dns Service IP: this pod
+                  # has edenprairie as a fallback, so a plain lookup would succeed through
+                  # it and hide the outage. On the healthchecks.io path because
+                  # Alertmanager cannot mail about a DNS outage it needs DNS to report.
+                  # BEGIN kubedns: nix run .#regenerate-manifests overwrites this block from cluster.json
+                  KUBEDNS_IP="10.0.0.254"
+                  # END kubedns
+                  if nslookup kubernetes.default.svc.cluster.local "$KUBEDNS_IP" >/dev/null 2>&1; then
+                    ok "cluster DNS: in-cluster records resolve via ${KUBEDNS_IP}"
+                  else
+                    fail "cluster DNS: ${KUBEDNS_IP} cannot resolve kubernetes.default.svc.cluster.local"
+                  fi
+                  # A separate failure mode: CoreDNS can serve cluster.local
+                  # perfectly while its `forward .` is broken, which breaks every
+                  # image pull and outbound call.
+                  if nslookup github.com "$KUBEDNS_IP" >/dev/null 2>&1; then
+                    ok "cluster DNS: upstream forwarding works"
+                  else
+                    fail "cluster DNS: ${KUBEDNS_IP} cannot resolve external names (forward broken)"
+                  fi
+                  # One answering replica hides two dead ones, the Service
+                  # keeps working right up until the last pod dies. Same blind
+                  # spot the AdGuard replica check below exists to close.
+                  CD=$(kubectl -n kube-system get deploy coredns -o jsonpath='{.status.readyReplicas}/{.status.replicas}' 2>/dev/null)
+                  CDR=${CD%%/*}; CDW=${CD##*/}
+                  [ -z "$CDR" ] && CDR=0
+                  if [ -n "$CDW" ] && [ "$CDR" = "$CDW" ]; then ok "coredns ${CDR}/${CDW} replicas ready"; else fail "coredns only ${CDR}/${CDW:-unknown} replicas ready"; fi
+
+                  # 7. Household DNS, end to end through the VIP every device
+                  # uses - a real DoH query, not a liveness probe.
+                  DOH="https://${ADGUARD_VIP}/dns-query?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB"
+                  code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 "$DOH" 2>/dev/null)
+                  if [ "$code" = "200" ]; then ok "household DNS: DoH via ${ADGUARD_VIP} -> 200"; else fail "household DNS: DoH via ${ADGUARD_VIP} -> ${code:-no response}"; fi
+
+                  # 8. AdGuard replica health. The DoH check above passes as long
+                  # as one replica answers the VIP, so it cannot see two of three
+                  # being dead, which is one bad moment away from total DNS loss.
+                  AGD=$(kubectl -n adguard get ds adguard -o jsonpath='{.status.numberReady}/{.status.desiredNumberScheduled}' 2>/dev/null)
+                  AGR=${AGD%%/*}; AGW=${AGD##*/}
+                  if [ -n "$AGD" ] && [ "$AGR" = "$AGW" ]; then ok "adguard ${AGD} replicas ready"; else fail "adguard only ${AGD:-unknown} replicas ready"; fi
+
+                  # 8b. L2-announcement leases held by a node with no local backend. Cilium
+                  # elects a holder per Service without considering
+                  # externalTrafficPolicy: Local, so the winner can be a node that will
+                  # refuse the traffic it just started ARP-announcing for. The VIP goes
+                  # dark while the pod stays healthy. Fix: delete the lease to
+                  # force re-election.
+                  L2BAD=""
+                  L2SVCS=$(kubectl get svc -A -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.namespace}|{.metadata.name}|{.spec.externalTrafficPolicy}{"\n"}{end}' 2>/dev/null \
+                    | grep '|Local$' || true)
+                  while IFS='|' read -r ns svc _etp; do
+                    [ -n "$ns" ] || continue
+                    holder=$(kubectl -n kube-system get lease "cilium-l2announce-${ns}-${svc}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true)
+                    # No lease yet is not a fault: nothing is being announced,
+                    # so nothing is being blackholed.
+                    [ -n "$holder" ] || continue
+                    ready=$(kubectl -n "$ns" get endpointslices -l "kubernetes.io/service-name=${svc}" -o jsonpath='{range .items[*]}{range .endpoints[?(@.conditions.ready==true)]}{.nodeName}{"\n"}{end}{end}' 2>/dev/null || true)
+                    if ! printf '%s\n' "$ready" | grep -qx "$holder"; then
+                      L2BAD="${L2BAD}${ns}/${svc}(announced by ${holder}, no ready backend there) "
+                    fi
+                  done <<< "$L2SVCS"
+                  if [ -n "$L2BAD" ]; then
+                    fail "L2 announcement on a node with no local backend: ${L2BAD}-- delete the lease to force re-election"
+                  else
+                    ok "all Local-policy VIPs announced by a node that hosts a backend"
+                  fi
+
+                  # 9. Recent OOMKills anywhere. Catches a once-a-day kill too slow to trip
+                  # KubePodCrashLooping that still takes a service down each time.
+                  # jsonpath: `$.metadata.name` does not resolve inside a nested range.
+                  OOM=$(kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{range .status.containerStatuses[*]}|{.name}={.lastState.terminated.reason}{end}{"\n"}{end}' 2>/dev/null \
+                    | grep OOMKilled \
+                    | awk -F'|' '{for(i=2;i<=NF;i++) if ($i ~ /=OOMKilled$/) {split($i,a,"="); printf "%s:%s ", $1, a[1]}}')
+                  if [ -n "$OOM" ]; then info "containers with a previous OOMKill (raise limits if recurring): ${OOM}"; else ok "no recent OOMKills"; fi
+
+                  # 11. Image supply chain, the cheap version of an admission controller.
+                  # Reads workload specs, not pods: Job objects are ephemeral copies of an
+                  # old template and would report images already fixed. Untrusted registry
+                  # FAILS; unpinned only INFOs.
+                  # BEGIN registries: nix run .#regenerate-manifests overwrites this block from cluster.json
+                  ALLOWED_REGISTRIES="docker.io quay.io ghcr.io registry.k8s.io cr.step.sm"
+                  # END registries
+                  SPECS=$(kubectl get deployments,daemonsets,statefulsets,cronjobs -A -o jsonpath='{range .items[*]}{range .spec.template.spec.containers[*]}{.image}{"\n"}{end}{range .spec.template.spec.initContainers[*]}{.image}{"\n"}{end}{range .spec.jobTemplate.spec.template.spec.containers[*]}{.image}{"\n"}{end}{range .spec.jobTemplate.spec.template.spec.initContainers[*]}{.image}{"\n"}{end}{end}' 2>/dev/null | sort -u | grep . || true)
+                  if [ -z "$SPECS" ]; then
+                    fail "could not list workload images"
+                  else
+                    BAD_REG=""; UNPINNED=""
+                    for I in $SPECS; do
+                      case "$I" in
+                        */*/*) REG=${I%%/*} ;;
+                        */*)   case "${I%%/*}" in *.*|*:*) REG=${I%%/*} ;; *) REG="docker.io" ;; esac ;;
+                        *)     REG="docker.io" ;;
+                      esac
+                      case " $ALLOWED_REGISTRIES " in *" $REG "*) ;; *) BAD_REG="$BAD_REG $I" ;; esac
+                      case "$I" in
+                        *@sha256:*) ;;
+                        *:latest|*:master|*:main|*:edge) UNPINNED="$UNPINNED $I" ;;
+                        *:*) ;;
+                        *) UNPINNED="$UNPINNED ${I}(no-tag)" ;;
+                      esac
+                    done
+                    if [ -n "$BAD_REG" ]; then fail "images from untrusted registries:${BAD_REG}"; else ok "all images from trusted registries"; fi
+                    [ -n "$UNPINNED" ] && info "unpinned images (drift risk, not an outage):${UNPINNED}"
+                  fi
+
+                  # 10. Flux. Ready has three values: False means reconciliation failed,
+                  # Unknown means it is reconciling right now, which every Kustomization
+                  # does on its interval. A permanently stuck Unknown is FluxNotReporting.
+                  FLUXK=$(kubectl get kustomizations -A -o jsonpath='{range .items[*]}{.metadata.name}|{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null)
+                  FLUXH=$(kubectl get helmreleases -A -o jsonpath='{range .items[*]}{.metadata.name}|{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null)
+                  BADK=$(printf '%s\n' "$FLUXK" | awk -F'|' '$1!="" && $2=="False"{printf "%s ", $1}')
+                  BADH=$(printf '%s\n' "$FLUXH" | awk -F'|' '$1!="" && $2=="False"{printf "%s ", $1}')
+                  BUSYK=$(printf '%s\n' "$FLUXK" | awk -F'|' '$1!="" && $2!="True" && $2!="False"{printf "%s ", $1}')
+                  BUSYH=$(printf '%s\n' "$FLUXH" | awk -F'|' '$1!="" && $2!="True" && $2!="False"{printf "%s ", $1}')
+                  if [ -n "$BADK" ]; then fail "Flux Kustomizations FAILED: ${BADK}"; else ok "no failing Flux Kustomizations"; fi
+                  if [ -n "$BADH" ]; then fail "Flux HelmReleases FAILED: ${BADH}"; else ok "no failing Flux HelmReleases"; fi
+                  [ -n "${BUSYK}${BUSYH}" ] && info "Flux currently reconciling (not paging): ${BUSYK}${BUSYH}"
+
+                  # 12. Losing either flag makes external-dns publish public A records
+                  # pointing at Traefik's LAN VIP, silently. Read off the running
+                  # deployment, so a dropped Helm value is caught too.
+                  EDARGS=$(kubectl -n external-dns get deploy external-dns -o jsonpath='{.spec.template.spec.containers[*].args}' 2>/dev/null || true)
+                  if [ -z "$EDARGS" ]; then
+                    fail "external-dns deployment not found - public DNS records are unmanaged"
+                  else
+                    EDMISS=""
+                    case "$EDARGS" in *--force-default-targets*) ;; *) EDMISS="$EDMISS --force-default-targets" ;; esac
+                    case "$EDARGS" in *--default-targets=*) ;; *) EDMISS="$EDMISS --default-targets" ;; esac
+                    if [ -n "$EDMISS" ]; then
+                      fail "external-dns is missing${EDMISS} - it will publish LAN addresses publicly"
+                    else
+                      ok "external-dns default-target flags present"
+                    fi
+                  fi
+
+                  # 13. Pod-CIDR drift: cilium's live pool against cluster.json
+                  # (spliced in below). node.spec.podCIDR is NOT comparable -
+                  # those are stale pre-migration allocations that cluster-pool
+                  # IPAM ignores. A mismatched values file crashes
+                  # kube-controller-manager; the lease check catches that death
+                  # whatever its cause, since KCM runs on the nodes where no
+                  # pod-level alert can see it.
+                  # BEGIN podcidr: nix run .#regenerate-manifests overwrites this block from cluster.json
+                  EXPECT_POD_CIDR="10.2.0.0/16"
+                  # END podcidr
+                  LIVE_POOL=$(kubectl -n kube-system get cm cilium-config -o jsonpath='{.data.cluster-pool-ipv4-cidr}' 2>/dev/null || true)
+                  if [ "$LIVE_POOL" != "$EXPECT_POD_CIDR" ]; then
+                    fail "cilium pod CIDR pool is '$LIVE_POOL', cluster.json says $EXPECT_POD_CIDR"
+                  else
+                    ok "cilium pod CIDR pool matches cluster.json"
+                  fi
+                  KCM_RENEW=$(kubectl -n kube-system get lease kube-controller-manager -o jsonpath='{.spec.renewTime}' 2>/dev/null || true)
+                  NOW=$(date +%s)
+                  # busybox date: no ISO8601-with-fraction parsing - strip the
+                  # fraction and give the format explicitly.
+                  KCM_TS=$(date -u -D '%Y-%m-%dT%H:%M:%S' -d "${KCM_RENEW%%.*}" +%s 2>/dev/null || echo 0)
+                  if [ $((NOW - KCM_TS)) -gt 120 ]; then
+                    fail "kube-controller-manager lease not renewed since ${KCM_RENEW:-never} - KCM is down"
+                  else
+                    ok "kube-controller-manager lease fresh"
+                  fi
+
+                  printf '%s' "$DETAILS"
+
+                  # Exit 0 even when checks failed: the /fail ping is the signal; exiting
+                  # non-zero would also fail the Job, tripping KubeJobFailed and mailing the
+                  # same incident twice.
+                  exit 0
+              resources:
+                requests: { cpu: 20m, memory: 64Mi }
+                limits: { memory: 256Mi }

@@ -1,0 +1,18 @@
+# Longhorn Helm values, 3-node cluster
+defaultSettings:
+  defaultReplicaCount: 3
+  nodeDownPodDeletionPolicy: delete-both-statefulset-and-deployment-pod
+  # A chart upgrade moves longhorn-manager, the UI and the CSI sidecars but not
+  # the per-volume engines, the actual data path, unless this is > 0, and it
+  # defaults to 0. Without it "we are running Longhorn X" is false where it
+  # matters most.
+  # 1, not higher: Longhorn upgrades this many volumes per node at a time and
+  # skips any that are not attached and healthy, so a bad engine swap is
+  # contained to one volume. Set to 0 to freeze engines.
+  concurrentAutomaticEngineUpgradePerNodeLimit: 1
+  # backupTarget is set and cleared on a schedule by a CronJob
+  backupTarget: ""
+  backupTargetPollInterval: 0
+
+persistence:
+  defaultClassReplicaCount: 3

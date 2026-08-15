@@ -1,0 +1,45 @@
+# Everything here lands in flux-system: the HelmRelease objects themselves and
+# the values ConfigMaps they reference. The releases still deploy into their
+# own namespaces via targetNamespace.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: flux-system
+
+resources:
+  # Chart sources have to be applied alongside the releases, or every HelmChart
+  # fails with 'HelmRepository ... not found'.
+  - helm-repositories.yaml
+  - helmreleases.yaml
+
+# Hash-suffixed generators, on purpose: helm-controller does not watch
+# ConfigMap CONTENT, so with a fixed name a values edit sits unapplied until
+# something else touches the HelmRelease. The content hash renames the
+# ConfigMap, kustomizeconfig.yaml rewrites valuesFrom to match, and the spec
+# change makes helm-controller upgrade immediately.
+# Cost: this Kustomization does not prune (uninstall protection), so
+# superseded values ConfigMaps linger in flux-system; delete stale ones by
+# hand when they bother you.
+configurations:
+  - kustomizeconfig.yaml
+
+configMapGenerator:
+  - name: cilium-values
+    files: [values.yaml=cilium-values.yaml]
+  - name: cert-manager-values
+    files: [values.yaml=cert-manager-values.yaml]
+  - name: external-dns-values
+    files: [values.yaml=external-dns-values.yaml]
+  - name: traefik-values
+    files: [values.yaml=traefik-values.yaml]
+  - name: longhorn-values
+    files: [values.yaml=longhorn-values.yaml]
+  - name: kube-prometheus-stack-values
+    files: [values.yaml=kube-prometheus-stack-values.yaml]
+  - name: loki-values
+    files: [values.yaml=loki-values.yaml]
+  - name: alloy-values
+    files: [values.yaml=alloy-values.yaml]
+  - name: immich-values
+    files: [values.yaml=immich-values.yaml]
+  - name: kured-values
+    files: [values.yaml=kured-values.yaml]

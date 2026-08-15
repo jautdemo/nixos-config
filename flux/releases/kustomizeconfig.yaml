@@ -1,0 +1,10 @@
+# Teaches kustomize that HelmRelease.spec.valuesFrom.name references a
+# ConfigMap, so the generated hash-suffixed names are rewritten into the
+# HelmReleases. Without this the hashed generators would break every
+# valuesFrom reference.
+nameReference:
+  - kind: ConfigMap
+    version: v1
+    fieldSpecs:
+      - path: spec/valuesFrom/name
+        kind: HelmRelease

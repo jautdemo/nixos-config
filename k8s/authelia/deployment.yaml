@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+# DaemonSet: sessions live in Redis and storage in MariaDB, so every pod is
+# interchangeable, and one per node keeps auth working while any node is down.
+kind: DaemonSet
+metadata:
+  name: authelia
+  namespace: authelia
+spec:
+  selector:
+    matchLabels:
+      app: authelia
+  template:
+    metadata:
+      labels:
+        app: authelia
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      initContainers:
+        - name: wait-for-redis
+          image: alpine:3.24
+          command: ['sh', '-c', 'until nc -z redis.redis 6379; do sleep 2; done']
+      containers:
+        - name: authelia
+          image: authelia/authelia:4.39
+          ports:
+            - containerPort: 9091
+              name: http
+          env:
+            - name: TZ
+              value: UTC
+            - name: X_AUTHELIA_CONFIG_FILTERS
+              value: template
+            - name: AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: authelia-secrets
+                  key: jwt-secret
+            - name: AUTHELIA_SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: authelia-secrets
+                  key: session-secret
+            - name: AUTHELIA_STORAGE_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: authelia-secrets
+                  key: storage-mysql-password
+            - name: AUTHELIA_NOTIFIER_SMTP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: authelia-secrets
+                  key: smtp-password
+            - name: AUTHELIA_AUTHENTICATION_BACKEND_LDAP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: authelia-secrets
+                  key: ldap-password
+            - name: AUTHELIA_STORAGE_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: authelia-secrets
+                  key: storage-encryption-key
+            - name: AUTHELIA_IDENTITY_PROVIDERS_OIDC_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: authelia-secrets
+                  key: oidc-hmac-secret
+          volumeMounts:
+            - name: config
+              mountPath: /config/configuration.yml
+              subPath: configuration.yml
+              readOnly: true
+            - name: step-ca-root
+              mountPath: /certs/root_ca.crt
+              subPath: ca.pem
+              readOnly: true
+            # jwks[].key and clients[].client_secret can't be set via env var
+            # (Authelia doesn't support that for list entries) - mounted as
+            # files instead and read via {{ fileContent }} in the config.
+            - name: oidc-secrets
+              mountPath: /secrets-oidc
+              readOnly: true
+          resources:
+            requests:
+              memory: 64Mi
+              cpu: 50m
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: config
+          configMap:
+            name: authelia-config
+        - name: step-ca-root
+          configMap:
+            name: step-ca-root
+        - name: oidc-secrets
+          secret:
+            secretName: authelia-secrets
+            items:
+              - key: oidc-jwk-private-key
+                path: oidc-jwk-private-key.pem
+              - key: oidc-immich-client-secret
+                path: oidc-immich-client-secret

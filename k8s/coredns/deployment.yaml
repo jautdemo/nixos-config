@@ -1,0 +1,122 @@
+# Keep the image version aligned with pkgs.coredns in the nixpkgs pin.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coredns
+  namespace: kube-system
+  labels:
+    k8s-app: kube-dns
+    kubernetes.io/name: CoreDNS
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      k8s-app: kube-dns
+  # A new pod must be genuinely Ready (see readinessProbe) and stay that way
+  # for minReadySeconds before any old pod is retired. maxUnavailable: 0 means
+  # DNS capacity never dips below 3 during a rollout, and a broken image or
+  # Corefile stalls the rollout with the healthy pods still serving instead of
+  # draining them one by one (the outage).
+  minReadySeconds: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        k8s-app: kube-dns
+    spec:
+      serviceAccountName: coredns
+      # Without this the three replicas land 2/1/0, and kured reboots a node
+      # most nights, so that is one reboot from losing two thirds of cluster DNS.
+      # ScheduleAnyway, not DoNotSchedule: under a hard constraint a cordoned
+      # node during a drain leaves a CoreDNS pod permanently Pending, and the
+      # rule meant to protect DNS takes it out instead.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      # Resolve upstream via the node's resolv.conf (edenprairie dnsmasq),
+      # never via cluster DNS: CoreDNS must not depend on itself.
+      dnsPolicy: Default
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+        - key: node-role.kubernetes.io/master
+          effect: NoSchedule
+        - key: CriticalAddonsOnly
+          operator: Exists
+      containers:
+        - name: coredns
+          image: registry.k8s.io/coredns/coredns:v1.14.6
+          imagePullPolicy: IfNotPresent
+          args: ["-conf", "/etc/coredns/Corefile"]
+          ports:
+            - name: dns
+              containerPort: 10053
+              protocol: UDP
+            - name: dns-tcp
+              containerPort: 10053
+              protocol: TCP
+            - name: metrics
+              containerPort: 10055
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 10054
+              scheme: HTTP
+            initialDelaySeconds: 60
+            timeoutSeconds: 5
+            successThreshold: 1
+            failureThreshold: 5
+          # Served by the Corefile's `ready` plugin. Without a readinessProbe
+          # a container counts as Ready as soon as it starts, so a pod that
+          # crashes immediately still flickers Ready on every restart and the
+          # Deployment keeps retiring healthy pods behind it.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 10056
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            successThreshold: 1
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 70Mi
+            limits:
+              memory: 170Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              # REQUIRED even though CoreDNS binds unprivileged 10053. The
+              # registry image ships /coredns with a cap_net_bind_service
+              # file capability, and the kernel refuses to exec a file-caps
+              # binary whose capabilities are not in the container's
+              # permitted set: "exec /coredns: operation not permitted",
+              # CrashLoopBackOff, cluster DNS down. Upstream's own manifest
+              # adds it for the same reason. A binary without file caps does
+              # not need it, so the gap stays invisible until the image changes.
+              add: ["NET_BIND_SERVICE"]
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/coredns
+              readOnly: true
+      volumes:
+        - name: config-volume
+          configMap:
+            name: coredns
+            items:
+              - key: Corefile
+                path: Corefile

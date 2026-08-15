@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - alloy-syslog-service.yaml
+  - dashboard-temperatures.yaml
+  - step-ca-root-configmap.yaml
+  - flux-monitoring.yaml
+  - edenprairie-monitoring.yaml
+  - etcd-and-infra-monitoring.yaml
+  - cert-expiry-monitoring.yaml

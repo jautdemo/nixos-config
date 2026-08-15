@@ -1,0 +1,88 @@
+# Logical redis dump (RDB via replication stream) -> NAS (age-encrypted).
+# redis has AOF on so it's snapshot-safer than mariadb, but a point-in-time RDB
+# is portable and inspectable. Same NAS dir + offsite path.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: db-backup-redis-nfs
+spec:
+  capacity: { storage: 5Gi }
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  mountOptions: [nfsvers=4.1, sec=sys, hard, noatime]
+  nfs:
+    server: nas.infra.homelab.invalid
+    path: /volume1/longhorn-backups/db-backup
+  storageClassName: ""
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: db-backup-nfs
+  namespace: redis
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  volumeName: db-backup-redis-nfs
+  resources: { requests: { storage: 5Gi } }
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: redis-backup
+  namespace: redis
+spec:
+  # NAS outage 2026-08-13: every run breaks on the dead NFS mount.
+  # Unsuspend when the NAS is back.
+  suspend: true
+  # Staggered off mariadb-backup (08:20); no two backup jobs share a minute.
+  schedule: "35 8 * * *"
+  timeZone: "UTC"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Failures included: only new failures rotate the history out, so one
+      # transient failure would keep KubeJobFailed firing forever.
+      ttlSecondsAfterFinished: 86400
+      backoffLimit: 2
+      template:
+        metadata:
+          # Stable label so the redis NetworkPolicy can allow this job in
+          # specifically.
+          labels:
+            app: redis-backup
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: alpine:3.24
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  DATE=$(date +%Y-%m-%d_%H%M%S)
+                  OUT="/backup/redis-${DATE}.rdb.age"
+                  apk add --no-cache redis age curl >/dev/null
+
+                  # Stream a point-in-time RDB from the live server (no auth set).
+                  redis-cli -h redis.redis.svc -p 6379 --rdb /tmp/dump.rdb
+                  age -R /age/recipients -o "${OUT}" /tmp/dump.rdb
+                  rm -f /tmp/dump.rdb
+
+                  SZ=$(stat -c%s "${OUT}")
+                  echo "wrote ${OUT} (${SZ} bytes)"
+                  [ "${SZ}" -gt 64 ] || { echo "ERROR: rdb suspiciously small"; exit 1; }
+
+                  find /backup -name "redis-*.rdb.age" -mtime +14 -delete
+
+                  # backup-audit verifies this artifact; no ping needed here.
+              volumeMounts:
+                - { name: backup, mountPath: /backup }
+                - { name: age, mountPath: /age, readOnly: true }
+          volumes:
+            - name: age
+              configMap: { name: age-recipients }
+            - name: backup
+              persistentVolumeClaim: { claimName: db-backup-nfs }

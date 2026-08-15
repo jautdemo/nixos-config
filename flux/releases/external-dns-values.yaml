@@ -1,0 +1,62 @@
+# external-dns values.
+
+sources:
+  - ingress
+  - service
+
+domainFilters:
+  - homelab.invalid
+
+provider:
+  name: cloudflare
+
+# Losing either target flag publishes public A records pointing at
+# Traefik's LAN VIP; cluster-healthcheck (check 12) asserts both are
+# still present.
+#
+#   --default-targets        publish a CNAME to the in-cluster cloudflared
+#                            tunnel instead of deriving an A record from the
+#                            source's own address (which is Traefik's LAN VIP).
+#   --force-default-targets  required: since v0.21 a plain --default-targets is
+#                            ignored whenever the source supplies a target, and
+#                            an Ingress always does.
+#   --cloudflare-proxied     new services inherit the WAF and the origin
+#                            lock rather than sitting outside them.
+#
+# Both target flags must be extraArgs: chart 1.21.1 has no `defaultTargets`
+# value and silently drops one. `helm template` after touching this.
+#
+# Internal-only services stay out of DNS via
+# `external-dns.alpha.kubernetes.io/controller: "none"` on their Ingress; that
+# is independent of these defaults.
+extraArgs:
+  - --default-targets=deadbeef-dead-beef-dead-beefdeadbe03.cfargotunnel.com
+  - --force-default-targets
+  - --cloudflare-proxied
+
+policy: upsert-only
+registry: txt
+txtOwnerId: k8s-cluster
+txtPrefix: "_externaldns."
+
+logLevel: info
+
+env:
+  - name: CF_API_TOKEN
+    valueFrom:
+      secretKeyRef:
+        name: cloudflare-api-token
+        key: cf-api-token
+
+rbac:
+  additionalPermissions:
+    - apiGroups: ["traefik.io", "traefik.containo.us"]
+      resources: ["ingressroutes", "ingressroutetcps", "ingressrouteudps"]
+      verbs: ["get", "watch", "list"]
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    memory: 64Mi

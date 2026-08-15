@@ -1,0 +1,255 @@
+---
+# Checks that every backup artifact landed on the NAS today at a sane size. A
+# per-job OnFailure cannot see an empty-but-successful backup.
+#
+# The only healthchecks.io check for everything under /volume1/longhorn-backups.
+# A new job that lands an artifact there gets a check_glob line, not its own
+# check. 09:30: after every backup lands, still inside the Longhorn window.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: backup-audit
+  namespace: longhorn-system
+rules:
+  - apiGroups: ["longhorn.io"]
+    resources: ["backups", "volumes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: backup-audit
+  namespace: longhorn-system
+subjects:
+  - kind: ServiceAccount
+    name: backup-window
+    namespace: longhorn-system
+roleRef:
+  kind: Role
+  name: backup-audit
+  apiGroup: rbac.authorization.k8s.io
+---
+# Read-only view of the whole backup share, so the auditor can stat artifacts.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: backup-audit-nfs
+spec:
+  capacity: { storage: 1Gi }
+  accessModes: [ReadOnlyMany]
+  persistentVolumeReclaimPolicy: Retain
+  mountOptions: [nfsvers=4.1, sec=sys, ro, hard, noatime]
+  nfs:
+    server: nas.infra.homelab.invalid
+    path: /volume1/longhorn-backups
+  storageClassName: ""
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backup-audit-nfs
+  namespace: longhorn-system
+spec:
+  accessModes: [ReadOnlyMany]
+  storageClassName: ""
+  volumeName: backup-audit-nfs
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup-audit
+  namespace: longhorn-system
+spec:
+  # NAS outage 2026-08-13: every run breaks on the dead NFS mount.
+  # Unsuspend when the NAS is back.
+  suspend: true
+  schedule: "30 9 * * *"
+  # Explicit: with no timeZone, k8s evaluates the cron expression in the
+  # node's local time, which drifts the healthchecks.io window by the UTC
+  # offset.
+  timeZone: "UTC"
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Failures included: only new failures rotate the history out, so one
+      # transient failure keeps KubeJobFailed firing indefinitely. Safe because
+      # success is judged from the artifacts, never from Job objects.
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          serviceAccountName: backup-window
+          restartPolicy: OnFailure
+          # The NAS NFS export is sec=sys and only grants root (like the other
+          # backup jobs, which run as root). bitnami/kubectl defaults to UID
+          # 1001, which gets EACCES on the share, so pin the pod to root.
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          containers:
+            - name: audit
+              # alpine/k8s, not bitnami/kubectl: the latter publishes no version
+              # tags, so it can only be pinned by digest with no upgrade path.
+              # The gap is busybox find, which has no -printf.
+              image: alpine/k8s:1.36.2
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: TZ
+                  value: UTC          # match the hosts, so <date> lines up with filenames
+                - name: SMTP_HOST
+                  value: edenprairie.infra.homelab.invalid
+                - name: SMTP_PORT
+                  value: "11025"
+                - name: SMTP_FROM
+                  value: notifications@homelab.invalid
+                - name: SMTP_TO
+                  value: admin@homelab.invalid
+                - name: SMTP_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: backup-notify-smtp   # filled by protonmail-bridge-setup
+                      key: smtp-password
+                - name: HC_PING_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: healthchecks-ping
+                      key: ping-key
+              command: ["/bin/sh", "-c"]
+              volumeMounts:
+                - name: nas
+                  mountPath: /backup
+                  readOnly: true
+                - name: step-ca-root
+                  mountPath: /certs/root_ca.crt
+                  subPath: ca.pem
+                  readOnly: true
+              args:
+                - |
+                  set -eu
+                  # Pings on every exit path, so it proves the audit itself ran.
+                  # Without it, a controller-manager that stops firing the
+                  # CronJob is perfectly silent.
+                  trap 'curl -fsS -m10 --retry 5 --retry-delay 2 --retry-all-errors --retry-max-time 45 -o /dev/null "https://hc-ping.com/${HC_PING_KEY}/backup-audit?create=1" || true' EXIT
+                  DATE=$(date +%Y-%m-%d)
+                  DOW=$(date +%u)          # 1=Mon .. 7=Sun
+                  NAS=/backup
+                  FAILED=0
+                  DETAILS=""
+                  # A real newline: in --data-raw "\n" is a literal backslash-n
+                  # and the mail arrives as one long line. $() eats trailing
+                  # newlines.
+                  NL=$(printf '\nx'); NL=${NL%x}
+
+                  # check_glob "Label" subdir "glob" min_count min_bytes
+                  # Verifies >= min_count matches exist for today and none are undersized.
+                  check_glob() {
+                    label="$1"; dir="$2"; pat="$3"; minc="$4"; minsz="$5"
+                    n=0; small=0
+                    for f in "$NAS/$dir"/$pat; do
+                      [ -e "$f" ] || continue
+                      n=$((n + 1))
+                      sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
+                      [ "$sz" -lt "$minsz" ] && small=$((small + 1))
+                    done
+                    if [ "$n" -lt "$minc" ]; then
+                      FAILED=$((FAILED + 1)); DETAILS="${DETAILS}  FAIL ${label}: found ${n}, need ${minc} for ${DATE}${NL}"
+                    elif [ "$small" -gt 0 ]; then
+                      FAILED=$((FAILED + 1)); DETAILS="${DETAILS}  FAIL ${label}: ${small} file(s) suspiciously small${NL}"
+                    else
+                      DETAILS="${DETAILS}  OK   ${label}: ${n} file(s)${NL}"
+                    fi
+                  }
+
+                  # 1000000: a real etcd snapshot here is ~400MB; 1MB still
+                  # catches an empty or truncated db.
+                  check_glob "etcd (duluth)"   etcd-backup       "etcd-duluth-${DATE}_*.db.age"        1 1000000
+                  check_glob "etcd (bemidji)"  etcd-backup       "etcd-bemidji-${DATE}_*.db.age"       1 1000000
+                  check_glob "etcd (fargo)"    etcd-backup       "etcd-fargo-${DATE}_*.db.age"         1 1000000
+                  # 15000: an empty-lldap tar was ~7.4KB, a real one ~21KB, fail below 15KB.
+                  check_glob "LDAP/CA/KDC state" edenprairie-backup "edenprairie-state-${DATE}_*.tar.gz.age" 1 15000
+                  # 1024/100: loose floors - an age header alone is ~200
+                  # bytes, so these catch an empty plaintext, not a small one.
+                  # Real sizes: mariadb dumps are MBs, redis ~430KB.
+                  check_glob "mariadb dump"    db-backup         "mariadb-${DATE}_*.sql.gz.age"        1 1024
+                  check_glob "redis dump"      db-backup         "redis-${DATE}_*.rdb.age"             1 100
+                  check_glob "immich postgres dump" db-backup    "immich-postgres-${DATE}_*.sql.gz.age" 1 1024
+                  check_glob "k8s secrets"     secrets-backup    "secrets-${DATE}_*.json.age"          1 1024
+
+                  # not an offsite check - it only proves the local snapshot
+                  # exists. Whether anything reached Proton is OffsiteSyncStale.
+                  if [ -d "$NAS/versions/${DATE}" ]; then
+                    DETAILS="${DETAILS}  OK   local snapshot: versions/${DATE}${NL}"
+                  else
+                    FAILED=$((FAILED + 1)); DETAILS="${DETAILS}  FAIL local snapshot: versions/${DATE} missing${NL}"
+                  fi
+
+                  # Read the artifacts, not backups.longhorn.io. Those CRs are a
+                  # cache synced only while backupTargetURL is set, which this
+                  # cluster clears outside the window, and one CR with a null
+                  # backupCreatedAt aborts the whole jq program - a confident
+                  # "no backups found" over a healthy backupstore.
+                  LH_DIR="$NAS/backupstore/volumes"
+                  if [ ! -d "$LH_DIR" ]; then
+                    FAILED=$((FAILED + 1)); DETAILS="${DETAILS}  FAIL longhorn: backupstore missing at ${LH_DIR}${NL}"
+                  else
+                    # A volume counts as backed up today if it has a backup
+                    # config written today. busybox find has no -printf, so
+                    # "modified today" is a reference file at 00:00 plus -newer.
+                    REF=$(mktemp)
+                    touch -t "$(date +%Y%m%d)0000" "$REF"
+                    LH_TODAY=$(find "$LH_DIR" -name 'backup_*.cfg' -newer "$REF" 2>/dev/null \
+                      | sed 's#/backups/[^/]*$##' | xargs -r -n1 basename 2>/dev/null | sort -u || true)
+                    rm -f "$REF"
+                    LH_OK=$(printf '%s\n' "$LH_TODAY" | grep -c . || true)
+                    # Names the volumes with no backup today, so a single
+                    # silently-skipped one is not hidden behind a plausible
+                    # count. Runs under /bin/sh: no process substitution.
+                    LIVE_F=$(mktemp); TODAY_F=$(mktemp)
+                    kubectl -n longhorn-system get volumes.longhorn.io -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep . | sort -u > "$LIVE_F" || true
+                    printf '%s\n' "$LH_TODAY" | grep . | sort -u > "$TODAY_F" || true
+                    MISSING=$(comm -23 "$LIVE_F" "$TODAY_F" 2>/dev/null | tr '\n' ' ' || true)
+                    rm -f "$LIVE_F" "$TODAY_F"
+                    if [ "$LH_OK" -eq 0 ]; then
+                      FAILED=$((FAILED + 1)); DETAILS="${DETAILS}  FAIL longhorn: no backup artifacts written for ${DATE}${NL}"
+                    else
+                      DETAILS="${DETAILS}  OK   longhorn: ${LH_OK} volumes backed up ${DATE}${NL}"
+                    fi
+                    # Detached volumes are legitimately skipped by the
+                    # recurring job, so this is reported, not failed, but it
+                    # is reported BY NAME.
+                    [ -n "$MISSING" ] && DETAILS="${DETAILS}  ...  longhorn: no backup today for: ${MISSING}${NL}"
+                  fi
+
+                  if [ "$FAILED" -gt 0 ]; then
+                    SUBJECT="[BACKUP FAILED] ${FAILED} check(s) failed - ${DATE}"
+                  else
+                    SUBJECT="[BACKUP OK] all backups verified - ${DATE}"
+                  fi
+                  BODY="Backup audit - ${DATE}\n---\n${DETAILS}---\nFailures: ${FAILED}\n"
+                  echo "$SUBJECT"; printf '%b' "$BODY"
+
+                  # Success e-mails only on Sunday; failures always.
+                  if [ "$FAILED" -eq 0 ] && [ "$DOW" != "7" ]; then
+                    echo "All good and not Sunday - no e-mail."
+                    exit 0
+                  fi
+
+                  MSG=$(mktemp)
+                  printf "From: %s\r\nTo: %s\r\nSubject: %s\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n%b\r\n" \
+                    "$SMTP_FROM" "$SMTP_TO" "$SUBJECT" "$BODY" > "$MSG"
+                  curl --silent --show-error --ssl-reqd --cacert /certs/root_ca.crt \
+                    --url "smtp://${SMTP_HOST}:${SMTP_PORT}" \
+                    --mail-from "$SMTP_FROM" --mail-rcpt "$SMTP_TO" \
+                    --user "notifications@homelab.invalid:${SMTP_PASSWORD}" \
+                    --upload-file "$MSG"
+                  rm -f "$MSG"
+                  echo "E-mail sent."
+          volumes:
+            - name: nas
+              persistentVolumeClaim:
+                claimName: backup-audit-nfs
+            - name: step-ca-root
+              hostPath:
+                path: /var/lib/kubernetes/pki
+                type: Directory

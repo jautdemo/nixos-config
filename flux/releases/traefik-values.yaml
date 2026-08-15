@@ -1,0 +1,55 @@
+# Traefik values.
+ingressClass:
+  enabled: true
+  isDefaultClass: true
+
+# DaemonSet, not Deployment. Cilium's L2-announcement election picks a node
+# without checking it hosts a backend, so with one replica any election
+# landing elsewhere blackholes the VIP. Safe: traefik holds no state here.
+deployment:
+  kind: DaemonSet
+
+# externalTrafficPolicy: Local preserves the real client IP that Authelia and
+# the access logs depend on. Safe with the DaemonSet above, which guarantees a
+# backend on whichever node receives the traffic.
+service:
+  type: LoadBalancer
+  spec:
+    externalTrafficPolicy: Local
+  annotations:
+    # BEGIN vip: nix run .#regenerate-manifests overwrites this block from cluster.json
+    lbipam.cilium.io/ips: "192.168.1.220"
+    # END vip
+
+ports:
+  # 443 must not require client certs: it serves both tunnel and direct LAN
+  # traffic. A TLSOption named `default` with RequireAndVerifyClientCert
+  # would lock out every internal admin UI.
+  websecure:
+    http:
+      tls:
+        enabled: true
+    # The Cloudflare path is pod-originated (the relay dials the VIP), so Cilium
+    # never treats it as external and ClientAddr would be the gateway pod's IP.
+    # trustedIPs is the whole pod CIDR because pod IPs are ephemeral; a
+    # NetworkPolicy is what stops another pod spoofing a header.
+    forwardedHeaders:
+      trustedIPs:
+        # BEGIN trustedips: nix run .#regenerate-manifests overwrites this block from cluster.json
+        - "10.2.0.0/16"
+        # END trustedips
+
+# Chart v41 renamed logs.access -> accessLog and camelCased the keys. An
+# unmigrated block is silently ignored.
+accessLog:
+  enabled: true
+  format: json
+  # With no trustedIPs configured Traefik distrusts an unverified peer's
+  # forwarded headers and drops them - a missing X-Forwarded-For in the
+  # access log means Traefik dropped it, not that Cloudflare omitted it.
+  fields:
+    headers:
+      defaultMode: drop
+      names:
+        Cf-Connecting-Ip: keep
+        X-Forwarded-For: keep

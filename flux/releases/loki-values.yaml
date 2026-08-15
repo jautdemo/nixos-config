@@ -1,0 +1,136 @@
+# Loki, SingleBinary mode.
+
+deploymentMode: SingleBinary
+
+singleBinary:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+  persistence:
+    enabled: true
+    storageClass: longhorn
+    size: 25Gi
+  # Push API on a LoadBalancer VIP for external log sources; IP from
+  # cluster.json.
+  service:
+    type: LoadBalancer
+    # BEGIN vip: nix run .#regenerate-manifests overwrites this block from cluster.json
+    loadBalancerIP: "192.168.1.226"
+    annotations:
+      lbipam.cilium.io/ips: "192.168.1.226"
+    # END vip
+    port: 3100
+  extraVolumes:
+    - name: loki-tls
+      secret:
+        secretName: loki-tls
+  extraVolumeMounts:
+    - name: loki-tls
+      mountPath: /etc/loki/tls
+      readOnly: true
+
+read:
+  replicas: 0
+write:
+  replicas: 0
+backend:
+  replicas: 0
+
+gateway:
+  enabled: false
+
+lokiCanary:
+  enabled: false
+
+test:
+  enabled: false
+
+resultsCache:
+  enabled: false
+
+chunksCache:
+  enabled: false
+
+loki:
+  auth_enabled: false
+
+  storage:
+    type: filesystem
+    filesystem:
+      chunks_directory: /var/loki/chunks
+      rules_directory: /var/loki/rules
+
+  schemaConfig:
+    configs:
+      - from: "2024-01-01"
+        store: tsdb
+        object_store: filesystem
+        schema: v13
+        index:
+          prefix: index_
+          period: 24h
+
+  limits_config:
+    # must fit the 25Gi PVC: if ingest fills it first, Loki breaks on a full
+    # disk before retention ever engages.
+    retention_period: 30d
+    max_query_series: 5000
+    max_query_lookback: 30d
+
+  compactor:
+    retention_enabled: true
+    delete_request_store: filesystem
+
+  commonConfig:
+    replication_factor: 1
+
+  # All three probes have to say https. http_tls_config below puts TLS on 3100, so
+  # a plain-HTTP probe gets a 400 and can never pass. Miss one and the chart
+  # default applies, so kubelet kills loki every 300s, losing the logs of
+  # whatever you would want them for. A broken liveness probe is silent in a way
+  # a readiness probe is not: the pod reports Running and only the restart count
+  # betrays it.
+  readinessProbe:
+    httpGet:
+      path: /ready
+      port: http-metrics
+      scheme: HTTPS
+    periodSeconds: 10
+    initialDelaySeconds: 15
+    successThreshold: 1
+    failureThreshold: 3
+    timeoutSeconds: 5
+
+  livenessProbe:
+    httpGet:
+      path: /loki/api/v1/status/buildinfo
+      port: http-metrics
+      scheme: HTTPS
+    periodSeconds: 30
+    successThreshold: 1
+    failureThreshold: 10
+    timeoutSeconds: 5
+
+  # WAL replay is slow and serves nothing while it runs. Without a
+  # startupProbe the liveness clock runs during the replay; this holds
+  # liveness and readiness off until loki answers once (up to 60 x 10s).
+  startupProbe:
+    httpGet:
+      path: /ready
+      port: http-metrics
+      scheme: HTTPS
+    periodSeconds: 10
+    failureThreshold: 60
+    timeoutSeconds: 5
+
+  # TLS on 3100 for the out-of-cluster Alloy pushers (see the service
+  # comment above).
+  server:
+    http_listen_port: 3100
+    http_tls_config:
+      cert_file: /etc/loki/tls/tls.crt
+      key_file: /etc/loki/tls/tls.key

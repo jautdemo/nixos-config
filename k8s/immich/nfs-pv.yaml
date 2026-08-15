@@ -1,0 +1,33 @@
+# Deliberately not a Longhorn volume: compute in k8s, storage on the NAS.
+#
+# sec=krb5p, not sec=sys. Unlike the backup shares this library has no
+# compensating encryption anywhere, so under sec=sys the only protection would
+# be "whoever reaches the export claiming the right UID".
+#
+# Manual step, not expressible here: the NAS-side export rule for the immich
+# folder must be set to Krb5p in DSM (Control Panel -> Shared Folder -> immich
+# -> NFS Permissions). It defaults to sec=sys, which silently undermines this.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: immich-library-nfs
+spec:
+  capacity: { storage: 500Gi }
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  mountOptions: [nfsvers=4.1, sec=krb5p, hard, noatime]
+  nfs:
+    server: nas.infra.homelab.invalid
+    path: /volume1/immich
+  storageClassName: ""
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: immich-library
+  namespace: immich
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  volumeName: immich-library-nfs
+  resources: { requests: { storage: 500Gi } }

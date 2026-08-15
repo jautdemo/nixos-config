@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mariadb
+  namespace: mariadb
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: mariadb
+  template:
+    metadata:
+      labels:
+        app: mariadb
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: mariadb
+          image: linuxserver/mariadb:11.8.8
+          ports:
+            - containerPort: 3306
+          env:
+            - name: TZ
+              value: UTC
+            - name: PUID
+              value: "1000"
+            - name: PGID
+              value: "1000"
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mariadb-credentials
+                  key: root-password
+            # No MYSQL_USER/MYSQL_PASSWORD: they only apply at initdb, and only
+            # autheliaDbUser and backup connect to this database.
+          # Recreate the nightly-backup DB user on every start so a restored
+          # or rebuilt volume cannot silently lose it; ALTER makes a password
+          # rotation take effect on the next pod restart. Root needs the
+          # password even locally (the image sets no unix_socket auth).
+          # Gives up quietly after the retry window: a missing user is
+          # caught loudly by the backup job, not by killing the DB.
+          # Constraint: the backup password must not contain single quotes
+          # or backslashes.
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    PW=$(cat /run/backup-password/password)
+                    case "$PW" in *"'"*|*'\'*)
+                      echo "backup password must not contain quotes or backslashes"; exit 0;;
+                    esac
+                    for i in $(seq 1 60); do
+                      if mariadb -uroot -p"$MYSQL_ROOT_PASSWORD" -e "SELECT 1" >/dev/null 2>&1; then
+                        mariadb -uroot -p"$MYSQL_ROOT_PASSWORD" -e "CREATE USER IF NOT EXISTS 'backup'@'%' IDENTIFIED BY '$PW'; \
+                          ALTER USER 'backup'@'%' IDENTIFIED BY '$PW'; \
+                          GRANT SELECT,SHOW VIEW,TRIGGER,EVENT,LOCK TABLES,PROCESS,RELOAD,REPLICATION CLIENT ON *.* TO 'backup'@'%'; \
+                          FLUSH PRIVILEGES;"
+                        exit 0
+                      fi
+                      sleep 2
+                    done
+                    exit 0
+          volumeMounts:
+            - name: data
+              mountPath: /config
+            - name: backup-password
+              mountPath: /run/backup-password
+              readOnly: true
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 100m
+            limits:
+              memory: 1Gi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: mariadb-data
+        - name: backup-password
+          secret:
+            secretName: mariadb-backup-credentials

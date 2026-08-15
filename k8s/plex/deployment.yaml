@@ -1,0 +1,139 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: plex
+  namespace: plex
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: plex
+  template:
+    metadata:
+      labels:
+        app: plex
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      # Deliberately not pinned to a node. GPU access comes from requesting
+      # gpu.intel.com/i915 (k8s/intel-gpu-plugin/), which works on every node,
+      # and duluth/bemidji have the faster GPUs, so let the scheduler choose.
+      initContainers:
+        - name: vaapi-stage
+          # musl, not glibc, is the crux: Plex Transcoder links libgcompat, the
+          # musl compat shim, so it cannot load a glibc-built VAAPI stack even
+          # though the base image is Ubuntu. Intel's own .debs pass vainfo and
+          # then die inside Plex on a glibc-2.38+ symbol musl does not provide.
+          # Alpine packages are musl-built, which matches.
+          # The closure is copied via ldd rather than hand-listed: a missing
+          # dependency surfaces as an unhelpful relocation error at runtime.
+          image: alpine:3.24
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              apk add --no-cache intel-media-driver libva >/dev/null
+              mkdir -p /stage/dri /stage/lib
+              cp -L /usr/lib/dri/iHD_drv_video.so /stage/dri/
+              # Copy every shared object the driver actually needs, plus libva
+              # itself (Plex's bundled libva is older than the driver's
+              # __vaDriverInit ABI, so loader and driver must move together).
+              for f in $(ldd /usr/lib/dri/iHD_drv_video.so 2>/dev/null | awk '{print $3}' | grep -E '^/' ) \
+                       /usr/lib/libva.so.2 /usr/lib/libva-drm.so.2 /lib/ld-musl-x86_64.so.1; do
+                [ -f "$f" ] && cp -L "$f" /stage/lib/ 2>/dev/null || true
+              done
+              for f in $(ldd /usr/lib/libva.so.2 2>/dev/null | awk '{print $3}' | grep -E '^/'); do
+                [ -f "$f" ] && cp -L "$f" /stage/lib/ 2>/dev/null || true
+              done
+              echo "staged driver:"; ls -la /stage/dri
+              echo "staged libs:";   ls -la /stage/lib
+          volumeMounts:
+            - name: vaapi
+              mountPath: /stage
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 512Mi }
+      containers:
+        - name: plex
+          image: linuxserver/plex:1.43.2
+          ports:
+            - containerPort: 32400
+              name: plex
+          env:
+            - name: TZ
+              value: UTC
+            - name: PUID
+              value: "11000"
+            - name: PGID
+              value: "11000"
+            - name: UMASK
+              value: "002"
+            - name: PLEX_PASS
+              value: "yes"
+            - name: VERSION
+              value: latest
+            - name: ADVERTISE_IP
+              # BEGIN advertise: nix run .#regenerate-manifests overwrites this block from cluster.json
+              value: http://192.168.1.224:32400
+              # END advertise
+            - name: ALLOWED_NETWORKS
+              value: 192.168.1.0/24,10.0.0.0/8
+            # Point Plex's libva at the staged musl-built driver instead of the
+            # one it downloads for itself (which cannot init on this GPU).
+            # LD_LIBRARY_PATH must come along so the matching libva is used,
+            # see the musl/ABI note in the initContainer above.
+            - name: LIBVA_DRIVERS_PATH
+              value: /opt/vaapi/dri
+            - name: LIBVA_DRIVER_NAME
+              value: iHD
+            # Plex's own lib dir is kept as a FALLBACK, not dropped: Plex
+            # binaries resolve their bundled libs from there, and replacing the
+            # whole search path would break startup rather than just VAAPI.
+            # Ours comes first so the staged libva wins for the driver.
+            - name: LD_LIBRARY_PATH
+              value: /opt/vaapi/lib:/usr/lib/plexmediaserver/lib
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: media
+              mountPath: /data/media
+              readOnly: true
+            - name: transcode
+              mountPath: /transcode
+            - name: vaapi
+              mountPath: /opt/vaapi
+              readOnly: true
+          resources:
+            requests:
+              memory: 1Gi
+              # The request is the scheduling guarantee and the cgroup CPU
+              # weight under contention - that is what protects Plex, not the
+              # limit below.
+              cpu: "1"
+            limits:
+              memory: 8Gi
+              # No CPU limit: a limit is a CFS quota per 100ms slice, not an
+              # average: transcoder startup and HLS writes burst past a 4-core
+              # limit inside one slice with the node mostly idle, and Plex
+              # gets throttled at 9% average utilisation. The memory limit
+              # stays; memory is incompressible.
+              # THIS is what actually grants /dev/dri access. Without it the
+              # device nodes are either absent or unopenable (EPERM).
+              gpu.intel.com/i915: 1
+      volumes:
+        - name: config
+          persistentVolumeClaim:
+            claimName: plex-config
+        - name: media
+          persistentVolumeClaim:
+            claimName: plex-nfs-media
+        - name: transcode
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+        # The device plugin injects /dev/dri; a hostPath mount would grant
+        # visibility without access.
+        - name: vaapi
+          emptyDir: {}

@@ -1,0 +1,260 @@
+# The Helm releases.
+#
+# releaseName and storageNamespace are set explicitly on every one rather than
+# left to default: helm-controller adopts an existing release by finding its
+# `sh.helm.release.v1.<name>.v<n>` Secret, and a wrong storageNamespace makes
+# Flux install a second copy of something like cilium alongside the running one.
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: cilium
+spec:
+  interval: 30m
+  releaseName: cilium
+  targetNamespace: kube-system
+  storageNamespace: kube-system
+  chart:
+    spec:
+      chart: cilium
+      version: "1.20.0"
+      sourceRef: { kind: HelmRepository, name: cilium, namespace: flux-system }
+  valuesFrom:
+    - kind: ConfigMap
+      name: cilium-values
+      valuesKey: values.yaml
+  # hubble-peer: internalTrafficPolicy Local -> Cluster. With Local a node may
+  # only use its own backend, so one stale `quarantined` state, not a live
+  # probe failure, has no fallback and crashloops hubble-relay for days.
+  # Safe because this Service is only discovery: relay asks any agent for the
+  # peer list, then dials each node's :4244 directly, and every agent returns
+  # the same list. Local is a locality optimisation, not correctness.
+  # A post-render patch because the chart hardcodes it with no values knob, and
+  # a `kubectl patch` would be reverted by the next reconcile.
+  postRenderers:
+    - kustomize:
+        patches:
+          - target:
+              version: v1
+              kind: Service
+              name: hubble-peer
+              namespace: kube-system
+            patch: |
+              - op: replace
+                path: /spec/internalTrafficPolicy
+                value: Cluster
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: cert-manager
+spec:
+  interval: 30m
+  releaseName: cert-manager
+  targetNamespace: cert-manager
+  storageNamespace: cert-manager
+  chart:
+    spec:
+      chart: cert-manager
+      version: "v1.21.1"
+      sourceRef: { kind: HelmRepository, name: jetstack, namespace: flux-system }
+  valuesFrom:
+    - kind: ConfigMap
+      name: cert-manager-values
+      valuesKey: values.yaml
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: step-issuer
+spec:
+  interval: 30m
+  releaseName: step-issuer
+  targetNamespace: cert-manager
+  storageNamespace: cert-manager
+  chart:
+    spec:
+      chart: step-issuer
+      version: "1.11.0"
+      sourceRef: { kind: HelmRepository, name: smallstep, namespace: flux-system }
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: external-dns
+spec:
+  interval: 30m
+  releaseName: external-dns
+  targetNamespace: external-dns
+  storageNamespace: external-dns
+  chart:
+    spec:
+      chart: external-dns
+      version: "1.21.1"
+      sourceRef: { kind: HelmRepository, name: external-dns, namespace: flux-system }
+  valuesFrom:
+    - kind: ConfigMap
+      name: external-dns-values
+      valuesKey: values.yaml
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: traefik
+spec:
+  interval: 30m
+  releaseName: traefik
+  targetNamespace: traefik
+  storageNamespace: traefik
+  chart:
+    spec:
+      chart: traefik
+      version: "41.2.0"
+      sourceRef: { kind: HelmRepository, name: traefik, namespace: flux-system }
+  valuesFrom:
+    - kind: ConfigMap
+      name: traefik-values
+      valuesKey: values.yaml
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: longhorn
+spec:
+  interval: 30m
+  releaseName: longhorn
+  targetNamespace: longhorn-system
+  storageNamespace: longhorn-system
+  chart:
+    spec:
+      chart: longhorn
+      version: "1.12.0"
+      sourceRef: { kind: HelmRepository, name: longhorn, namespace: flux-system }
+  valuesFrom:
+    - kind: ConfigMap
+      name: longhorn-values
+      valuesKey: values.yaml
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: kube-prometheus-stack
+spec:
+  interval: 30m
+  releaseName: kube-prometheus-stack
+  targetNamespace: monitoring
+  storageNamespace: monitoring
+  # Large chart with slow-settling CRDs; ~5 minutes is normal.
+  timeout: 15m
+  chart:
+    spec:
+      chart: kube-prometheus-stack
+      version: "88.3.0"
+      sourceRef: { kind: HelmRepository, name: prometheus-community, namespace: flux-system }
+  valuesFrom:
+    - kind: ConfigMap
+      name: kube-prometheus-stack-values
+      valuesKey: values.yaml
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: loki
+spec:
+  interval: 30m
+  releaseName: loki
+  targetNamespace: monitoring
+  storageNamespace: monitoring
+  chart:
+    spec:
+      chart: loki
+      # Source is grafana-community, not grafana: grafana/loki 7.x+ is the
+      # Grafana Enterprise Logs chart, the OSS one lives here.
+      version: "18.8.0"
+      sourceRef: { kind: HelmRepository, name: grafana-community, namespace: flux-system }
+  valuesFrom:
+    - kind: ConfigMap
+      name: loki-values
+      valuesKey: values.yaml
+  # Without this loki cannot restart: it finds ring members through the
+  # headless loki-memberlist Service, which only publishes Ready pods, and
+  # loki is not Ready until it has joined the ring. At replicas: 1 there is no
+  # other member, so loki-0 must resolve itself, cannot, and crashloops
+  # forever. It survives only until something restarts it hard.
+  # publishNotReadyAddresses breaks the cycle. A postRenderer because the chart
+  # hardcodes that Service with no values knob (re-check on chart bumps), hence
+  # `op: add` rather than `replace`. Drop this if upstream ever adds the field.
+  postRenderers:
+    - kustomize:
+        patches:
+          - target:
+              version: v1
+              kind: Service
+              name: loki-memberlist
+              namespace: monitoring
+            patch: |
+              - op: add
+                path: /spec/publishNotReadyAddresses
+                value: true
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: alloy
+spec:
+  interval: 30m
+  releaseName: alloy
+  targetNamespace: monitoring
+  storageNamespace: monitoring
+  chart:
+    spec:
+      chart: alloy
+      version: "1.11.1"
+      sourceRef: { kind: HelmRepository, name: grafana, namespace: flux-system }
+  valuesFrom:
+    - kind: ConfigMap
+      name: alloy-values
+      valuesKey: values.yaml
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: immich
+spec:
+  interval: 30m
+  releaseName: immich
+  targetNamespace: immich
+  storageNamespace: immich
+  chart:
+    spec:
+      chart: immich
+      version: "0.13.1"
+      sourceRef: { kind: HelmRepository, name: immich, namespace: flux-system }
+  valuesFrom:
+    - kind: ConfigMap
+      name: immich-values
+      valuesKey: values.yaml
+---
+# kured, safe, serialised node reboots.
+# No targetNamespace of its own: it lives in kube-system
+# alongside the other node-level infrastructure.
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: kured
+spec:
+  interval: 30m
+  releaseName: kured
+  targetNamespace: kube-system
+  storageNamespace: kube-system
+  install:
+    createNamespace: false
+  chart:
+    spec:
+      chart: kured
+      version: "6.1.0"
+      sourceRef: { kind: HelmRepository, name: kured, namespace: flux-system }
+  valuesFrom:
+    - kind: ConfigMap
+      name: kured-values
+      valuesKey: values.yaml

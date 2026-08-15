@@ -1,0 +1,11 @@
+# `l2announcements.enabled: true` is dormant without this CR, this is what
+# actually turns on ARP replies for LoadBalancer IPs, on lan0.
+apiVersion: cilium.io/v2alpha1
+kind: CiliumL2AnnouncementPolicy
+metadata:
+  name: default
+spec:
+  interfaces:
+    - lan0
+  loadBalancerIPs: true
+  externalIPs: true
